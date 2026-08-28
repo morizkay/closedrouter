@@ -69,7 +69,9 @@
 	<div>
 		<p class="text-xs tracking-[0.28em] text-mist uppercase">Try it</p>
 		<h1 class="mt-2 text-3xl font-semibold tracking-tight">Playground</h1>
-		<p class="mt-2 text-sm text-mist">Uses the public OpenAI-compatible API with one of your keys.</p>
+		<p class="mt-2 text-sm text-mist">
+			Uses the public OpenAI-compatible API with one of your keys.
+		</p>
 	</div>
 
 	<form class="grid gap-3 md:grid-cols-2" onsubmit={send}>
@@ -83,7 +85,12 @@
 		</label>
 		<label class="text-xs text-mist uppercase">
 			API key (paste a created key)
-			<input class="mt-1" type="password" bind:value={apiKey} placeholder={keys[0] ? `${keys[0].key_prefix}…` : 'sk-cr-…'} />
+			<input
+				class="mt-1"
+				type="password"
+				bind:value={apiKey}
+				placeholder={keys[0] ? `${keys[0].key_prefix}…` : 'sk-cr-…'}
+			/>
 		</label>
 		<textarea class="min-h-24 md:col-span-2" bind:value={input} aria-label="Prompt"></textarea>
 		<button
@@ -103,7 +110,7 @@
 		{#each messages as message, i (i)}
 			<div class="rounded-2xl border border-line bg-panel p-4">
 				<p class="text-xs tracking-wide text-mist uppercase">{message.role}</p>
-				<p class="mt-2 whitespace-pre-wrap text-sm">{message.content}</p>
+				<p class="mt-2 text-sm whitespace-pre-wrap">{message.content}</p>
 			</div>
 		{/each}
 	</div>

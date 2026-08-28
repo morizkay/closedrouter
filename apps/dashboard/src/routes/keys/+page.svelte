@@ -68,7 +68,7 @@
 	{#if revealed}
 		<div class="mt-5 rounded-2xl border border-acid/30 bg-panel p-4">
 			<p class="text-xs text-mist">Copy now — this secret is not stored in plaintext.</p>
-			<p class="mt-2 break-all font-mono text-sm">{revealed}</p>
+			<p class="mt-2 font-mono text-sm break-all">{revealed}</p>
 			<button type="button" class="mt-3 text-sm text-acid" onclick={copyKey}>
 				{copied ? 'Copied' : 'Copy'}
 			</button>
@@ -97,7 +97,9 @@
 						<td class="px-4 py-3">{key.revoked_at ? 'Revoked' : 'Active'}</td>
 						<td class="px-4 py-3 text-right">
 							{#if !key.revoked_at}
-								<button type="button" class="text-danger" onclick={() => revoke(key.id)}>Revoke</button>
+								<button type="button" class="text-danger" onclick={() => revoke(key.id)}
+									>Revoke</button
+								>
 							{/if}
 						</td>
 					</tr>

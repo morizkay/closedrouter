@@ -1,4 +1,6 @@
-export type ProviderKind = 'openai' | 'anthropic';
+export type ProviderKind = 'openai' | 'anthropic' | 'deepseek' | 'glm';
+
+export type ModelCapability = 'chat' | 'embedding';
 
 export type StatusPayload = {
 	status: string;
@@ -8,6 +10,8 @@ export type StatusPayload = {
 	models: number;
 	host: string;
 	port: number;
+	embedding_dim?: number;
+	langfuse?: boolean;
 };
 
 export type ApiKey = {
@@ -38,6 +42,7 @@ export type Model = {
 	provider_kind: ProviderKind;
 	upstream_model: string;
 	display_name: string;
+	capability: ModelCapability;
 	created_at: number;
 };
 

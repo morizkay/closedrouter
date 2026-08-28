@@ -1,8 +1,11 @@
+//! HTTP error types returned to OpenAI- and Anthropic-shaped clients.
+
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
+/// Application error mapped to an OpenAI-style JSON body.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("{0}")]
@@ -64,9 +67,9 @@ impl IntoResponse for AppError {
     }
 }
 
-impl From<rusqlite::Error> for AppError {
-    fn from(value: rusqlite::Error) -> Self {
-        tracing::error!(error = %value, "sqlite error");
+impl From<sqlx::Error> for AppError {
+    fn from(value: sqlx::Error) -> Self {
+        tracing::error!(error = %value, "postgres error");
         AppError::Internal("database error".into())
     }
 }
@@ -84,4 +87,5 @@ impl From<reqwest::Error> for AppError {
     }
 }
 
+/// Result alias for handlers and DB helpers.
 pub type AppResult<T> = Result<T, AppError>;

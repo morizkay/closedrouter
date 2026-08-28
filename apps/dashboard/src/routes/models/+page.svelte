@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { adminRequest } from '$lib/api';
-	import type { ListResponse, Model, Provider, ProviderKind } from '$lib/types';
+	import type { ListResponse, Model, ModelCapability, Provider, ProviderKind } from '$lib/types';
 	import { onMount } from 'svelte';
 
 	let providers = $state<Provider[]>([]);
@@ -16,6 +16,7 @@
 	let modelProviderId = $state('');
 	let upstreamModel = $state('llama3.2');
 	let displayName = $state('Llama 3');
+	let capability = $state<ModelCapability>('chat');
 
 	async function load(): Promise<void> {
 		const [p, m] = await Promise.all([
@@ -65,7 +66,8 @@
 					id: modelId,
 					provider_id: modelProviderId,
 					upstream_model: upstreamModel,
-					display_name: displayName
+					display_name: displayName,
+					capability
 				})
 			});
 			await load();
@@ -89,8 +91,9 @@
 	<p class="text-xs tracking-[0.28em] text-mist uppercase">Catalog</p>
 	<h1 class="mt-2 text-3xl font-semibold tracking-tight">Providers and models</h1>
 	<p class="mt-2 text-sm text-mist">
-		OpenAI-compat (Ollama, vLLM, Groq, OpenAI) or Anthropic-compat upstreams. Friendly IDs are what
-		clients request.
+		OpenAI-compat (Ollama, vLLM, Groq, OpenAI, DeepSeek, GLM) or Anthropic-compat upstreams.
+		Friendly IDs are what clients request. Use capability <span class="font-mono">embedding</span> for
+		Hermes.
 	</p>
 
 	{#if error}
@@ -100,25 +103,37 @@
 	<div class="mt-8 grid gap-8 lg:grid-cols-2">
 		<form class="rounded-2xl border border-line bg-panel p-5" onsubmit={addProvider}>
 			<h2 class="font-medium">Add provider</h2>
-			<label class="mt-4 block text-xs text-mist uppercase">Name<input class="mt-1" bind:value={providerName} /></label>
+			<label class="mt-4 block text-xs text-mist uppercase"
+				>Name<input class="mt-1" bind:value={providerName} /></label
+			>
 			<label class="mt-3 block text-xs text-mist uppercase">
 				Kind
 				<select class="mt-1" bind:value={providerKind}>
 					<option value="openai">openai-compat</option>
 					<option value="anthropic">anthropic-compat</option>
+					<option value="deepseek">deepseek</option>
+					<option value="glm">glm / zhipu</option>
 				</select>
 			</label>
-			<label class="mt-3 block text-xs text-mist uppercase">Base URL<input class="mt-1" bind:value={baseUrl} /></label>
+			<label class="mt-3 block text-xs text-mist uppercase"
+				>Base URL<input class="mt-1" bind:value={baseUrl} /></label
+			>
 			<label class="mt-3 block text-xs text-mist uppercase">
 				Upstream API key (optional)
 				<input class="mt-1" type="password" bind:value={providerKey} />
 			</label>
-			<button type="submit" class="mt-5 rounded-full bg-acid px-4 py-2 text-sm font-semibold text-ink">Save provider</button>
+			<button
+				type="submit"
+				class="mt-5 rounded-full bg-acid px-4 py-2 text-sm font-semibold text-ink"
+				>Save provider</button
+			>
 		</form>
 
 		<form class="rounded-2xl border border-line bg-panel p-5" onsubmit={addModel}>
 			<h2 class="font-medium">Map model ID</h2>
-			<label class="mt-4 block text-xs text-mist uppercase">Friendly ID<input class="mt-1" bind:value={modelId} /></label>
+			<label class="mt-4 block text-xs text-mist uppercase"
+				>Friendly ID<input class="mt-1" bind:value={modelId} /></label
+			>
 			<label class="mt-3 block text-xs text-mist uppercase">
 				Provider
 				<select class="mt-1" bind:value={modelProviderId}>
@@ -127,9 +142,24 @@
 					{/each}
 				</select>
 			</label>
-			<label class="mt-3 block text-xs text-mist uppercase">Upstream model<input class="mt-1" bind:value={upstreamModel} /></label>
-			<label class="mt-3 block text-xs text-mist uppercase">Display name<input class="mt-1" bind:value={displayName} /></label>
-			<button type="submit" class="mt-5 rounded-full bg-acid px-4 py-2 text-sm font-semibold text-ink">Save model</button>
+			<label class="mt-3 block text-xs text-mist uppercase"
+				>Upstream model<input class="mt-1" bind:value={upstreamModel} /></label
+			>
+			<label class="mt-3 block text-xs text-mist uppercase"
+				>Display name<input class="mt-1" bind:value={displayName} /></label
+			>
+			<label class="mt-3 block text-xs text-mist uppercase">
+				Capability
+				<select class="mt-1" bind:value={capability}>
+					<option value="chat">chat</option>
+					<option value="embedding">embedding</option>
+				</select>
+			</label>
+			<button
+				type="submit"
+				class="mt-5 rounded-full bg-acid px-4 py-2 text-sm font-semibold text-ink"
+				>Save model</button
+			>
 		</form>
 	</div>
 
@@ -141,7 +171,9 @@
 					<p>{provider.name} <span class="font-mono text-mist">({provider.kind})</span></p>
 					<p class="font-mono text-xs text-mist">{provider.base_url}</p>
 				</div>
-				<button type="button" class="text-danger" onclick={() => removeProvider(provider.id)}>Delete</button>
+				<button type="button" class="text-danger" onclick={() => removeProvider(provider.id)}
+					>Delete</button
+				>
 			</li>
 		{/each}
 	</ul>
@@ -151,10 +183,16 @@
 		{#each models as model (model.id)}
 			<li class="flex items-center justify-between px-4 py-3 text-sm">
 				<div>
-					<p class="font-mono">{model.id} <span class="text-mist">→ {model.upstream_model}</span></p>
-					<p class="text-xs text-mist">{model.display_name} via {model.provider_name}</p>
+					<p class="font-mono">
+						{model.id} <span class="text-mist">→ {model.upstream_model}</span>
+					</p>
+					<p class="text-xs text-mist">
+						{model.display_name} via {model.provider_name} · {model.capability}
+					</p>
 				</div>
-				<button type="button" class="text-danger" onclick={() => removeModel(model.id)}>Delete</button>
+				<button type="button" class="text-danger" onclick={() => removeModel(model.id)}
+					>Delete</button
+				>
 			</li>
 		{/each}
 	</ul>

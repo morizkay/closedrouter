@@ -2,7 +2,7 @@
 	import favicon from '$lib/assets/favicon.svg';
 	import { resolve } from '$app/paths';
 
-	type Tab = 'openai' | 'anthropic' | 'cursor';
+	type Tab = 'openai' | 'anthropic' | 'cursor' | 'deepseek' | 'glm';
 
 	let tab = $state<Tab>('openai');
 
@@ -30,31 +30,52 @@ const res = await client.messages.create({
   max_tokens: 256,
   messages: [{ role: "user", content: "hello" }],
 });`,
-		cursor: `{
-  "OpenAI": {
-    "apiBase": "http://localhost:8080/v1",
-    "apiKey": "sk-cr-your-closedrouter-key",
-    "model": "llama3"
-  }
-}`
+		deepseek: `import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://localhost:8080",
+  apiKey: process.env.CLOSEDROUTER_API_KEY,
+});
+
+const res = await client.chat.completions.create({
+  model: "deepseek-chat",
+  messages: [{ role: "user", content: "hello" }],
+});`,
+		glm: `import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://localhost:8080/v4",
+  apiKey: process.env.CLOSEDROUTER_API_KEY,
+});
+
+await client.chat.completions.create({
+  model: "glm-4.5",
+  messages: [{ role: "user", content: "hello" }],
+  thinking: { type: "enabled" },
+});`,
+		cursor: `Cursor Settings → Models
+OpenAI Base URL: http://localhost:8080/v1
+OpenAI API Key:  sk-cr-your-closedrouter-key
+Model:           llama3`
 	};
 
 	const docker = `git clone https://github.com/morizkay/closedrouter.git
 cd closedrouter
 cp .env.example .env
-docker compose up --build`;
+docker compose up --build          # slim: postgres + gateway + ui
+docker compose --profile full up   # + traefik grafana loki prometheus langfuse`;
 </script>
 
 <svelte:head>
 	<title>ClosedRouter — OpenRouter, but local</title>
 	<meta
 		name="description"
-		content="Self-hosted LLM gateway with OpenAI- and Anthropic-compatible APIs. Your models, your keys, your network."
+		content="Self-hosted LLM gateway with OpenAI, Anthropic, DeepSeek, GLM, and Cursor-compatible APIs. Your models, your keys, your network."
 	/>
 	<meta property="og:title" content="ClosedRouter — OpenRouter, but local" />
 	<meta
 		property="og:description"
-		content="An LLM API gateway you run yourself. Docker, privacy, OpenAI + Anthropic SDKs."
+		content="An LLM API gateway you run yourself. Docker, privacy, OpenAI + Anthropic + DeepSeek + GLM + Cursor."
 	/>
 	<meta property="og:type" content="website" />
 	<link rel="icon" href={favicon} />
@@ -84,7 +105,7 @@ docker compose up --build`;
 		</nav>
 	</header>
 
-	<section class="relative z-10 mx-auto max-w-6xl px-6 pb-24 pt-10 md:pt-20">
+	<section class="relative z-10 mx-auto max-w-6xl px-6 pt-10 pb-24 md:pt-20">
 		<p class="mb-5 text-xs font-medium tracking-[0.28em] text-acid uppercase">
 			Private LLM gateway
 		</p>
@@ -92,8 +113,8 @@ docker compose up --build`;
 			OpenRouter, but local.
 		</h1>
 		<p class="mt-6 max-w-xl text-lg text-mist">
-			ClosedRouter is an LLM API gateway you run yourself. Point the OpenAI SDK, Anthropic SDK, or
-			Cursor at a box you control — Ollama, vLLM, Groq, or the frontier APIs, on your network.
+			ClosedRouter is an LLM API gateway you run yourself. Point the OpenAI SDK, Anthropic SDK,
+			DeepSeek, GLM, LangChain, or Cursor at a box you control.
 		</p>
 		<div class="mt-10 flex flex-wrap gap-3">
 			<a
@@ -119,7 +140,8 @@ docker compose up --build`;
 				<span class="h-2.5 w-2.5 rounded-full bg-acid/80"></span>
 				<span class="ml-3 font-mono">POST /v1/chat/completions</span>
 			</div>
-			<pre class="overflow-x-auto p-5 font-mono text-[13px] leading-relaxed text-paper/90">{`curl http://localhost:8080/v1/chat/completions \\
+			<pre
+				class="overflow-x-auto p-5 font-mono text-[13px] leading-relaxed text-paper/90">{`curl http://localhost:8080/v1/chat/completions \\
   -H "Authorization: Bearer sk-cr-..." \\
   -H "Content-Type: application/json" \\
   -d '{"model":"llama3","messages":[{"role":"user","content":"hello"}]}'`}</pre>
@@ -127,29 +149,8 @@ docker compose up --build`;
 	</section>
 </div>
 
-<section class="mx-auto grid max-w-6xl gap-4 px-6 pb-24 md:grid-cols-4">
-	{#each [
-		{
-			k: '01',
-			t: 'OpenAI compatible',
-			d: 'Drop-in /v1/chat/completions and /v1/models. Streaming or not.'
-		},
-		{
-			k: '02',
-			t: 'Anthropic compatible',
-			d: 'Speak /v1/messages natively. Same catalog, same keys.'
-		},
-		{
-			k: '03',
-			t: 'Self-hosted',
-			d: 'One docker compose. SQLite. No vendor lock-in, no traffic leaving your VPC unless you say so.'
-		},
-		{
-			k: '04',
-			t: 'Your models',
-			d: 'Map llama3 or claude-sonnet to Ollama, vLLM, LM Studio, Groq, OpenAI, Anthropic.'
-		}
-	] as item (item.k)}
+<section class="mx-auto grid max-w-6xl gap-4 px-6 pb-24 md:grid-cols-3">
+	{#each [{ k: '01', t: 'OpenAI + Cursor', d: 'Drop-in /v1/chat/completions and /v1/models. SSE, usage, tools.' }, { k: '02', t: 'Anthropic, DeepSeek, GLM', d: '/v1/messages, DeepSeek reasoning_content, GLM thinking / glm-4.5.' }, { k: '03', t: 'Self-hosted', d: 'Compose slim or full (Traefik, Grafana, Loki, Prometheus, Langfuse). Postgres + pgvector.' }, { k: '04', t: 'Your models', d: 'Map llama3 or glm-4 to Ollama, vLLM, Groq, OpenAI, Anthropic, DeepSeek, Zhipu.' }, { k: '05', t: 'Hermes memory', d: 'Store and recall embeddings per API key. 1536-d pgvector, OpenAI-compat embedders.' }, { k: '06', t: 'LangChain', d: 'ChatOpenAI and ChatAnthropic pointed at ClosedRouter. Examples in the repo.' }] as item (item.k)}
 		<div class="rounded-2xl border border-line bg-panel p-5">
 			<p class="font-mono text-xs text-acid">{item.k}</p>
 			<h2 class="mt-3 text-lg font-medium">{item.t}</h2>
@@ -164,23 +165,7 @@ docker compose up --build`;
 		One front door. Many upstreams.
 	</h2>
 	<ol class="mt-10 grid gap-4 md:grid-cols-3">
-		{#each [
-			{
-				n: '1',
-				t: 'Issue keys',
-				d: 'The dashboard mints ClosedRouter API keys. Clients never see upstream credentials.'
-			},
-			{
-				n: '2',
-				t: 'Map models',
-				d: 'Friendly IDs route to an OpenAI-compat or Anthropic-compat base URL and upstream model name.'
-			},
-			{
-				n: '3',
-				t: 'Translate & proxy',
-				d: 'Incoming OpenAI or Anthropic requests are converted when the upstream speaks the other dialect, including streams.'
-			}
-		] as step (step.n)}
+		{#each [{ n: '1', t: 'Issue keys', d: 'The dashboard mints ClosedRouter API keys. Clients never see upstream credentials.' }, { n: '2', t: 'Map models', d: 'Friendly IDs route to an OpenAI-compat or Anthropic-compat base URL and upstream model name.' }, { n: '3', t: 'Translate & proxy', d: 'OpenAI, Anthropic, DeepSeek, and GLM are converted when the upstream speaks another dialect, including streams.' }] as step (step.n)}
 			<li class="rounded-2xl border border-line bg-panel p-6">
 				<div
 					class="flex h-8 w-8 items-center justify-center rounded-full bg-acid font-mono text-sm text-ink"
@@ -196,14 +181,12 @@ docker compose up --build`;
 
 <section id="sdk" class="mx-auto max-w-6xl px-6 pb-24">
 	<p class="text-xs tracking-[0.28em] text-mist uppercase">SDKs</p>
-	<h2 class="mt-3 text-3xl font-semibold tracking-tight md:text-4xl">Point existing clients at it.</h2>
+	<h2 class="mt-3 text-3xl font-semibold tracking-tight md:text-4xl">
+		Point existing clients at it.
+	</h2>
 	<div class="mt-8 overflow-hidden rounded-2xl border border-line bg-panel">
 		<div class="flex gap-1 border-b border-line p-2">
-			{#each [
-				{ id: 'openai' as const, label: 'OpenAI SDK' },
-				{ id: 'anthropic' as const, label: 'Anthropic SDK' },
-				{ id: 'cursor' as const, label: 'Cursor' }
-			] as t (t.id)}
+			{#each [{ id: 'openai' as const, label: 'OpenAI SDK' }, { id: 'anthropic' as const, label: 'Anthropic SDK' }, { id: 'deepseek' as const, label: 'DeepSeek' }, { id: 'glm' as const, label: 'GLM' }, { id: 'cursor' as const, label: 'Cursor' }] as t (t.id)}
 				<button
 					type="button"
 					class="rounded-lg px-3 py-1.5 text-sm {tab === t.id
@@ -215,7 +198,9 @@ docker compose up --build`;
 				</button>
 			{/each}
 		</div>
-		<pre class="overflow-x-auto p-5 font-mono text-[13px] leading-relaxed text-paper/90">{snippets[tab]}</pre>
+		<pre class="overflow-x-auto p-5 font-mono text-[13px] leading-relaxed text-paper/90">{snippets[
+				tab
+			]}</pre>
 	</div>
 </section>
 
@@ -224,12 +209,12 @@ docker compose up --build`;
 		<div>
 			<p class="text-xs tracking-[0.28em] text-mist uppercase">Deploy</p>
 			<h2 class="mt-3 text-3xl font-semibold tracking-tight md:text-4xl">
-				One compose file. Gateway on 8080, dashboard on 3000.
+				One compose file. Slim on 8080/3000, or --profile full for the observability stack.
 			</h2>
 			<p class="mt-4 text-mist">
-				Rust gateway, SvelteKit admin, SQLite on a volume. Bind
-				<code class="font-mono text-acid">0.0.0.0:$PORT</code> for cloud hosts. The marketing site
-				on this page is what you deploy to Vercel — the gateway stays self-hosted.
+				Rust gateway, SvelteKit admin, Postgres + pgvector. Bind
+				<code class="font-mono text-acid">0.0.0.0:$PORT</code> for cloud hosts. The marketing site on
+				this page is what you deploy to Vercel — the gateway stays self-hosted.
 			</p>
 		</div>
 		<pre
@@ -238,7 +223,9 @@ docker compose up --build`;
 </section>
 
 <footer class="border-t border-line">
-	<div class="mx-auto flex max-w-6xl flex-col gap-4 px-6 py-10 text-sm text-mist md:flex-row md:items-center md:justify-between">
+	<div
+		class="mx-auto flex max-w-6xl flex-col gap-4 px-6 py-10 text-sm text-mist md:flex-row md:items-center md:justify-between"
+	>
 		<p>ClosedRouter — your models, your keys, your network.</p>
 		<div class="flex gap-6">
 			<a href="https://github.com/morizkay/closedrouter" class="hover:text-paper">GitHub</a>

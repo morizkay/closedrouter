@@ -39,7 +39,10 @@ export async function adminRequest<T>(path: string, init: RequestInit = {}): Pro
 
 	if (!response.ok) {
 		const err = parsed as GatewayError | null;
-		throw new ApiClientError(err?.error?.message ?? `Request failed (${response.status})`, response.status);
+		throw new ApiClientError(
+			err?.error?.message ?? `Request failed (${response.status})`,
+			response.status
+		);
 	}
 
 	return parsed as T;

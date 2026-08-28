@@ -16,8 +16,6 @@ COPY config.example.yaml /etc/closedrouter/config.example.yaml
 COPY crates/gateway/config.docker.yaml /etc/closedrouter/config.yaml
 ENV HOST=0.0.0.0 \
     PORT=8080 \
-    DATABASE_PATH=/data/closedrouter.db \
     RUST_LOG=info
 EXPOSE 8080
-VOLUME ["/data"]
 CMD ["closedrouter"]

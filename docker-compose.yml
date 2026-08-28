@@ -1,4 +1,22 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-closedrouter}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-closedrouter}
+      POSTGRES_DB: ${POSTGRES_DB:-closedrouter}
+    volumes:
+      - closedrouter-postgres:/var/lib/postgresql/data
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/02-langfuse.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-closedrouter} -d ${POSTGRES_DB:-closedrouter}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
   gateway:
     build:
       context: .
@@ -8,13 +26,28 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 8080
-      DATABASE_PATH: /data/closedrouter.db
+      DATABASE_URL: postgres://${POSTGRES_USER:-closedrouter}:${POSTGRES_PASSWORD:-closedrouter}@postgres:5432/${POSTGRES_DB:-closedrouter}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-change-me-now}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
       RUST_LOG: ${RUST_LOG:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-}
       CLOSEDROUTER_CONFIG: /etc/closedrouter/config.yaml
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      REQUEST_LOG_LIMIT: ${REQUEST_LOG_LIMIT:-10000}
+      LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-false}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
     volumes:
-      - closedrouter-data:/data
+      - ./crates/gateway/config.docker.yaml:/etc/closedrouter/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.gateway.rule=Host(`gateway.localhost`)
+      - traefik.http.routers.gateway.entrypoints=web
+      - traefik.http.services.gateway.loadbalancer.server.port=8080
     restart: unless-stopped
 
   dashboard:
@@ -29,7 +62,120 @@ services:
       PUBLIC_GATEWAY_URL: ${PUBLIC_GATEWAY_URL:-http://localhost:8080}
     depends_on:
       - gateway
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dashboard.rule=Host(`dashboard.localhost`)
+      - traefik.http.routers.dashboard.entrypoints=web
+      - traefik.http.services.dashboard.loadbalancer.server.port=3000
+    restart: unless-stopped
+
+  traefik:
+    image: traefik:v3.3
+    profiles: ["full"]
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --api.dashboard=true
+      - --log.level=INFO
+    ports:
+      - "80:80"
+      - "8081:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: ["full"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    depends_on:
+      - gateway
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.prometheus.rule=Host(`prometheus.localhost`)
+      - traefik.http.routers.prometheus.entrypoints=web
+      - traefik.http.services.prometheus.loadbalancer.server.port=9090
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.3.2
+    profiles: ["full"]
+    volumes:
+      - ./deploy/loki/loki.yml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/config.yaml
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    profiles: ["full"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./deploy/promtail/promtail.yml:/etc/promtail/config.yml:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: ["full"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_DEFAULT_THEME: dark
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3002:3000"
+    depends_on:
+      - prometheus
+      - loki
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.grafana.rule=Host(`grafana.localhost`)
+      - traefik.http.routers.grafana.entrypoints=web
+      - traefik.http.services.grafana.loadbalancer.server.port=3000
+    restart: unless-stopped
+
+  langfuse:
+    image: langfuse/langfuse:2
+    profiles: ["full"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3001:3000"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-closedrouter}:${POSTGRES_PASSWORD:-closedrouter}@postgres:5432/langfuse
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3001}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-closedrouter-nextauth-secret-change-me-please}
+      SALT: ${LANGFUSE_SALT:-closedrouter-langfuse-salt-change-me}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.langfuse.rule=Host(`langfuse.localhost`)
+      - traefik.http.routers.langfuse.entrypoints=web
+      - traefik.http.services.langfuse.loadbalancer.server.port=3000
     restart: unless-stopped
 
 volumes:
-  closedrouter-data:
+  closedrouter-postgres:
+  prometheus-data:
+  loki-data:
+  grafana-data:

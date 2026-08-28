@@ -3,13 +3,18 @@
 
 host: "0.0.0.0"
 port: 8080
-database_path: "./data/closedrouter.db"
+# database_url: "postgres://closedrouter:closedrouter@localhost:5432/closedrouter"
 # admin_token: "replace-me"
+# embedding_model: "text-embedding-3-small"
+# request_log_limit: 10000
 cors_origins:
-  - "http://localhost:3000"
-  - "http://127.0.0.1:3000"
-  - "http://localhost:5173"
-  - "http://127.0.0.1:5173"
+  - "*"
+
+langfuse:
+  enabled: false
+  # host: "http://localhost:3001"
+  # public_key: "pk-lf-..."
+  # secret_key: "sk-lf-..."
 
 # Seeded only when the catalog is empty (first boot).
 providers:
@@ -20,3 +25,4 @@ providers:
       - id: llama3
         upstream_model: llama3.2
         display_name: Llama 3
+        capability: chat
