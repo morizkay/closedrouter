@@ -1,0 +1,41 @@
+---
+import { CURL_SNIPPET } from '../lib/content';
+---
+
+<section class="relative z-10 mx-auto max-w-6xl px-6 pt-10 pb-24 md:pt-20">
+	<p class="mb-5 text-xs font-medium tracking-[0.28em] text-acid uppercase">Private LLM gateway</p>
+	<h1 class="max-w-3xl text-5xl leading-[0.95] font-semibold tracking-tight md:text-7xl">
+		OpenRouter, but local.
+	</h1>
+	<p class="mt-6 max-w-xl text-lg text-mist">
+		ClosedRouter is an LLM API gateway you run yourself. Point the OpenAI SDK, Anthropic SDK,
+		DeepSeek, GLM, LangChain, or Cursor at a box you control.
+	</p>
+	<div class="mt-10 flex flex-wrap gap-3">
+		<a
+			href="#docker"
+			class="rounded-full bg-acid px-5 py-2.5 text-sm font-semibold text-ink hover:brightness-95"
+		>
+			Self-host with Docker
+		</a>
+		<a
+			href="#sdk"
+			class="rounded-full border border-line px-5 py-2.5 text-sm text-paper hover:border-paper/40"
+		>
+			See the APIs
+		</a>
+	</div>
+
+	<div
+		class="mt-16 overflow-hidden rounded-2xl border border-line bg-panel/80 shadow-[0_0_80px_rgb(198_255_74_/_0.06)] backdrop-blur"
+	>
+		<div class="flex items-center gap-2 border-b border-line px-4 py-3 text-xs text-mist">
+			<span class="h-2.5 w-2.5 rounded-full bg-white/15"></span>
+			<span class="h-2.5 w-2.5 rounded-full bg-white/15"></span>
+			<span class="h-2.5 w-2.5 rounded-full bg-acid/80"></span>
+			<span class="ml-3 font-mono">POST /v1/chat/completions</span>
+		</div>
+		<pre
+			class="overflow-x-auto p-5 font-mono text-[13px] leading-relaxed text-paper/90">{CURL_SNIPPET}</pre>
+	</div>
+</section>

@@ -22,7 +22,7 @@ Cursor / OpenAI SDK / Anthropic SDK / DeepSeek SDK / GLM SDK / LangChain
 | --- | --- |
 | `closedrouter` (`crates/gateway`) | Axum HTTP API, translation, Hermes memory, `/metrics` |
 | `apps/dashboard` | SvelteKit 5 admin (adapter-node) |
-| `apps/landing` | Marketing site (adapter-vercel) |
+| `apps/landing` | Astro marketing site (adapter-vercel) |
 | Postgres 16 + pgvector | Keys, catalog, request logs, Hermes embeddings |
 | Traefik / Grafana / Loki / Prometheus / Langfuse | Observability; compose profile `full` |
 

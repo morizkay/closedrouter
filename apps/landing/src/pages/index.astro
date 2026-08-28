@@ -1,0 +1,28 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import Hero from '../components/Hero.astro';
+import ValueProps from '../components/ValueProps.astro';
+import HowItWorks from '../components/HowItWorks.astro';
+import SdkTabs from '../components/SdkTabs.astro';
+import DockerCta from '../components/DockerCta.astro';
+import Footer from '../components/Footer.astro';
+import { OG_DESCRIPTION, PAGE_DESCRIPTION, PAGE_TITLE } from '../lib/content';
+---
+
+<Layout title={PAGE_TITLE} description={PAGE_DESCRIPTION} ogDescription={OG_DESCRIPTION}>
+	<div class="relative overflow-hidden">
+		<div
+			class="pointer-events-none absolute inset-0 opacity-40"
+			style="background-image: radial-gradient(rgb(255 255 255 / 0.06) 1px, transparent 1px); background-size: 22px 22px;"
+		>
+		</div>
+		<Header />
+		<Hero />
+	</div>
+	<ValueProps />
+	<HowItWorks />
+	<SdkTabs />
+	<DockerCta />
+	<Footer />
+</Layout>

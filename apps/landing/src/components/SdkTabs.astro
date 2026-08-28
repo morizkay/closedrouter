@@ -1,0 +1,92 @@
+---
+import { SDK_TABS, SNIPPETS, type TabId } from '../lib/content';
+
+const firstTab: TabId = 'openai';
+---
+
+<section id="sdk" class="mx-auto max-w-6xl px-6 pb-24">
+	<p class="text-xs tracking-[0.28em] text-mist uppercase">SDKs</p>
+	<h2 class="mt-3 text-3xl font-semibold tracking-tight md:text-4xl">
+		Point existing clients at it.
+	</h2>
+	<div class="mt-8 overflow-hidden rounded-2xl border border-line bg-panel" data-sdk-root>
+		<div class="flex flex-wrap gap-1 border-b border-line p-2">
+			{
+				SDK_TABS.map((tab) => (
+					<button
+						type="button"
+						data-sdk-tab={tab.id}
+						aria-pressed={tab.id === firstTab ? 'true' : 'false'}
+						class:list={[
+							'rounded-lg px-3 py-1.5 text-sm',
+							tab.id === firstTab ? 'bg-white/10 text-paper' : 'text-mist hover:text-paper'
+						]}
+					>
+						{tab.label}
+					</button>
+				))
+			}
+		</div>
+		{
+			SDK_TABS.map((tab) => (
+				<pre
+					data-sdk-panel={tab.id}
+					hidden={tab.id !== firstTab}
+					class="overflow-x-auto p-5 font-mono text-[13px] leading-relaxed text-paper/90"
+				>
+					{SNIPPETS[tab.id]}
+				</pre>
+			))
+		}
+	</div>
+</section>
+
+<script>
+	const TAB_IDS = ['openai', 'anthropic', 'deepseek', 'glm', 'cursor'] as const;
+	type TabId = (typeof TAB_IDS)[number];
+
+	function isTabId(value: string): value is TabId {
+		return (TAB_IDS as readonly string[]).includes(value);
+	}
+
+	const ACTIVE = 'bg-white/10 text-paper';
+	const INACTIVE = 'text-mist hover:text-paper';
+
+	function setPressed(button: HTMLButtonElement, active: boolean): void {
+		button.setAttribute('aria-pressed', active ? 'true' : 'false');
+		button.className = `rounded-lg px-3 py-1.5 text-sm ${active ? ACTIVE : INACTIVE}`;
+	}
+
+	function showTab(root: HTMLElement, tab: TabId): void {
+		const buttons = root.querySelectorAll<HTMLButtonElement>('[data-sdk-tab]');
+		for (const button of buttons) {
+			const id = button.dataset.sdkTab;
+			if (!id || !isTabId(id)) continue;
+			setPressed(button, id === tab);
+		}
+
+		const panels = root.querySelectorAll<HTMLElement>('[data-sdk-panel]');
+		for (const panel of panels) {
+			const id = panel.dataset.sdkPanel;
+			if (!id || !isTabId(id)) continue;
+			panel.hidden = id !== tab;
+		}
+	}
+
+	function bindRoot(root: HTMLElement): void {
+		root.addEventListener('click', (event: MouseEvent) => {
+			const target = event.target;
+			if (!(target instanceof HTMLElement)) return;
+			const button = target.closest<HTMLButtonElement>('[data-sdk-tab]');
+			if (!button) return;
+			const id = button.dataset.sdkTab;
+			if (!id || !isTabId(id)) return;
+			showTab(root, id);
+		});
+	}
+
+	const roots = document.querySelectorAll<HTMLElement>('[data-sdk-root]');
+	for (const root of roots) {
+		bindRoot(root);
+	}
+</script>

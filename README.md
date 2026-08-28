@@ -1,6 +1,6 @@
 # ClosedRouter
 
-OpenRouter, but local. A self-hosted LLM API gateway with **OpenAI**, **Anthropic**, **DeepSeek**, **GLM**, and **Cursor**-compatible APIs, Hermes memory (pgvector), a SvelteKit dashboard, and a Vercel-ready marketing site.
+OpenRouter, but local. A self-hosted LLM API gateway with **OpenAI**, **Anthropic**, **DeepSeek**, **GLM**, and **Cursor**-compatible APIs, Hermes memory (pgvector), a SvelteKit dashboard, and an Astro marketing site (Vercel-ready).
 
 Your models, your keys, your network.
 
@@ -57,7 +57,7 @@ npm install
 PUBLIC_GATEWAY_URL=http://localhost:8080 npm run dev
 ```
 
-**Landing** (Vercel site):
+**Landing** (Astro marketing site on Vercel):
 
 ```bash
 cd apps/landing
@@ -149,14 +149,14 @@ cargo clippy -p closedrouter-gateway --all-targets -- -D warnings
 | --- | --- |
 | `crates/gateway` | Axum gateway |
 | `apps/dashboard` | Admin UI |
-| `apps/landing` | Marketing site — **Vercel project root** |
+| `apps/landing` | Astro marketing site — **Vercel project root** (`@astrojs/vercel`) |
 | `docker-compose.yml` | Slim default; `--profile full` for observability |
 | `examples/langchain` | ChatOpenAI / ChatAnthropic |
 | `docs/` | Architecture, API, Hermes |
 
 ## Vercel (landing only)
 
-The Rust gateway is **not** deployed on Vercel. Deploy `apps/landing` with **Root Directory** `apps/landing`.
+The Rust gateway is **not** deployed on Vercel. Deploy `apps/landing` (Astro static site built with `@astrojs/vercel`) with **Root Directory** set to `apps/landing`.
 
 ## Config
 
