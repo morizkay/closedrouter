@@ -195,7 +195,7 @@ pub fn openai_to_anthropic(body: &Value, upstream_model: &str) -> AppResult<Valu
         copy_if_present(body, obj, "stream");
         copy_if_present(body, obj, "temperature");
         copy_if_present(body, obj, "top_p");
-        copy_if_present(body, obj, "stop");
+        // Anthropic rejects unknown fields such as OpenAI's `stop`.
         if let Some(stop) = body.get("stop") {
             if stop.is_string() {
                 obj.insert("stop_sequences".into(), json!([stop]));
@@ -611,6 +611,39 @@ pub fn anthropic_event_to_openai_sse(
             });
             lines.push(format!("data: {chunk}"));
         }
+        "content_block_start" => {
+            let block = data.get("content_block");
+            if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use") {
+                let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let tool_id = block
+                    .and_then(|b| b.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("toolu_closedrouter");
+                let name = block
+                    .and_then(|b| b.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let chunk = json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": chrono::Utc::now().timestamp(),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": ""}
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                });
+                lines.push(format!("data: {chunk}"));
+            }
+        }
         "content_block_delta" => {
             if let Some(text) = data.pointer("/delta/text").and_then(Value::as_str) {
                 let chunk = json!({
@@ -646,6 +679,7 @@ pub fn anthropic_event_to_openai_sse(
                 .pointer("/delta/partial_json")
                 .and_then(Value::as_str)
             {
+                let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let chunk = json!({
                     "id": id,
                     "object": "chat.completion.chunk",
@@ -655,7 +689,7 @@ pub fn anthropic_event_to_openai_sse(
                         "index": 0,
                         "delta": {
                             "tool_calls": [{
-                                "index": 0,
+                                "index": index,
                                 "function": {"arguments": args}
                             }]
                         },
@@ -948,6 +982,77 @@ mod tests {
     fn openai_sse_done() {
         let lines = openai_data_to_anthropic_sse("[DONE]", &mut true);
         assert_eq!(lines[0], "event: message_stop");
+    }
+
+    #[test]
+    fn openai_stop_maps_to_stop_sequences_only() {
+        let body = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["END", "STOP"]
+        });
+        let out = openai_to_anthropic(&body, "claude").unwrap();
+        assert_eq!(out["stop_sequences"], json!(["END", "STOP"]));
+        assert!(out.get("stop").is_none());
+
+        let body = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": "END"
+        });
+        let out = openai_to_anthropic(&body, "claude").unwrap();
+        assert_eq!(out["stop_sequences"], json!(["END"]));
+        assert!(out.get("stop").is_none());
+    }
+
+    #[test]
+    fn anthropic_tool_use_start_emits_openai_tool_metadata() {
+        let data = json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_abc",
+                "name": "get_weather",
+                "input": {}
+            }
+        });
+        let lines = anthropic_event_to_openai_sse("content_block_start", &data, "chatcmpl-1", "m");
+        assert_eq!(lines.len(), 1);
+        let payload: Value =
+            serde_json::from_str(lines[0].strip_prefix("data: ").expect("data prefix")).unwrap();
+        let call = &payload["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["id"], "toolu_abc");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["index"], 1);
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(call["function"]["arguments"], "");
+    }
+
+    #[test]
+    fn anthropic_text_block_start_is_silent() {
+        let data = json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        });
+        let lines = anthropic_event_to_openai_sse("content_block_start", &data, "id", "m");
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn anthropic_tool_arg_delta_keeps_block_index() {
+        let data = json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}
+        });
+        let lines = anthropic_event_to_openai_sse("content_block_delta", &data, "id", "m");
+        let payload: Value =
+            serde_json::from_str(lines[0].strip_prefix("data: ").expect("data prefix")).unwrap();
+        let call = &payload["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"], 1);
+        assert_eq!(call["function"]["arguments"], "{\"city\":");
     }
 
     #[test]

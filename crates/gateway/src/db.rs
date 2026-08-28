@@ -1,5 +1,6 @@
 //! PostgreSQL + pgvector access for keys, catalog, logs, and Hermes memory.
 
+use crate::config::SeedProvider;
 use crate::error::{AppError, AppResult};
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
@@ -8,6 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -609,6 +611,100 @@ pub async fn model_count(pool: &PgPool) -> AppResult<i64> {
         .await?)
 }
 
+/// Insert missing config providers/models in a single transaction.
+///
+/// Completeness is "every config model id exists". A failed first boot that
+/// inserted some rows no longer permanently skips the rest: the next boot
+/// continues from the remaining items. New inserts in this call are atomic.
+pub async fn seed_catalog(pool: &PgPool, providers: &[SeedProvider]) -> AppResult<usize> {
+    if providers.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = pool.begin().await?;
+
+    let provider_rows = sqlx::query("SELECT id, name FROM providers")
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut name_to_id: HashMap<String, String> = HashMap::new();
+    for row in &provider_rows {
+        name_to_id.insert(row.try_get("name")?, row.try_get("id")?);
+    }
+
+    let model_rows = sqlx::query("SELECT id FROM models")
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut existing_models: HashSet<String> = HashSet::new();
+    for row in &model_rows {
+        existing_models.insert(row.try_get("id")?);
+    }
+
+    let mut inserted = 0usize;
+    for provider in providers {
+        let provider_id = if let Some(id) = name_to_id.get(&provider.name) {
+            id.clone()
+        } else {
+            let kind = normalize_kind(&provider.kind)?;
+            let name = require_nonempty(&provider.name, "name")?;
+            let base_url = require_nonempty(&provider.base_url, "base_url")?;
+            let id = Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO providers (id, name, kind, base_url, api_key) VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&id)
+            .bind(&name)
+            .bind(&kind)
+            .bind(&base_url)
+            .bind(provider.api_key.as_deref())
+            .execute(&mut *tx)
+            .await?;
+            name_to_id.insert(name, id.clone());
+            id
+        };
+
+        for model in &provider.models {
+            if existing_models.contains(&model.id) {
+                continue;
+            }
+            let id = require_nonempty(&model.id, "id")?;
+            if !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
+            {
+                return Err(AppError::BadRequest(
+                    "model id may only contain letters, numbers, dash, underscore, dot, or slash"
+                        .into(),
+                ));
+            }
+            let upstream_model = require_nonempty(&model.upstream_model, "upstream_model")?;
+            let capability = normalize_capability(model.capability.as_deref().unwrap_or("chat"))?;
+            let display_name = model
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&id)
+                .to_string();
+            sqlx::query(
+                "INSERT INTO models (id, provider_id, upstream_model, display_name, capability)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&id)
+            .bind(&provider_id)
+            .bind(&upstream_model)
+            .bind(&display_name)
+            .bind(&capability)
+            .execute(&mut *tx)
+            .await?;
+            existing_models.insert(id);
+            inserted += 1;
+        }
+    }
+
+    tx.commit().await?;
+    Ok(inserted)
+}
+
 /// Fields written to the bounded `request_logs` table.
 pub struct RequestLogWrite<'a> {
     pub key_id: Option<&'a str>,
@@ -1051,5 +1147,148 @@ mod tests {
         .expect("search");
         assert_eq!(found.len(), 1);
         assert!(found[0].content.contains("terse"));
+    }
+
+    #[tokio::test]
+    async fn seed_catalog_is_idempotent_and_completes_partial() {
+        let Some(pool) = crate::test_support::test_pool().await else {
+            assert!(
+                !crate::test_support::database_url_configured(),
+                "DATABASE_URL is set but Postgres is unreachable"
+            );
+            eprintln!("skipping postgres catalog seed test");
+            return;
+        };
+        let name = format!("seed-ok-{}", Uuid::new_v4());
+        let first_id = format!("ok-{}", Uuid::new_v4());
+        let second_id = format!("ok-{}", Uuid::new_v4());
+        let providers = vec![crate::config::SeedProvider {
+            name: name.clone(),
+            kind: "openai".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: None,
+            models: vec![
+                crate::config::SeedModel {
+                    id: first_id.clone(),
+                    upstream_model: "upstream-a".into(),
+                    display_name: None,
+                    capability: None,
+                },
+                crate::config::SeedModel {
+                    id: second_id.clone(),
+                    upstream_model: "upstream-b".into(),
+                    display_name: None,
+                    capability: None,
+                },
+            ],
+        }];
+        assert_eq!(seed_catalog(&pool, &providers).await.expect("seed"), 2);
+        assert_eq!(seed_catalog(&pool, &providers).await.expect("reseed"), 0);
+        let models = list_models(&pool).await.expect("list");
+        assert!(models.iter().any(|m| m.id == first_id));
+        assert!(models.iter().any(|m| m.id == second_id));
+    }
+
+    #[tokio::test]
+    async fn seed_catalog_rolls_back_when_a_later_model_is_invalid() {
+        let Some(pool) = crate::test_support::test_pool().await else {
+            assert!(
+                !crate::test_support::database_url_configured(),
+                "DATABASE_URL is set but Postgres is unreachable"
+            );
+            eprintln!("skipping postgres catalog seed rollback test");
+            return;
+        };
+        let name = format!("seed-atomic-{}", Uuid::new_v4());
+        let good_id = format!("ok-{}", Uuid::new_v4());
+        let providers = vec![crate::config::SeedProvider {
+            name: name.clone(),
+            kind: "openai".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: None,
+            models: vec![
+                crate::config::SeedModel {
+                    id: good_id.clone(),
+                    upstream_model: "upstream-a".into(),
+                    display_name: None,
+                    capability: None,
+                },
+                crate::config::SeedModel {
+                    id: "not a valid id".into(),
+                    upstream_model: "upstream-b".into(),
+                    display_name: None,
+                    capability: None,
+                },
+            ],
+        }];
+        assert!(seed_catalog(&pool, &providers).await.is_err());
+        let listed = list_providers(&pool).await.expect("providers");
+        assert!(
+            !listed.iter().any(|p| p.name == name),
+            "failed seed must not leave a partial provider"
+        );
+        let models = list_models(&pool).await.expect("models");
+        assert!(
+            !models.iter().any(|m| m.id == good_id),
+            "failed seed must roll back earlier model inserts"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_catalog_fills_in_missing_models_after_partial_boot() {
+        let Some(pool) = crate::test_support::test_pool().await else {
+            assert!(
+                !crate::test_support::database_url_configured(),
+                "DATABASE_URL is set but Postgres is unreachable"
+            );
+            eprintln!("skipping postgres catalog seed resume test");
+            return;
+        };
+        let name = format!("seed-resume-{}", Uuid::new_v4());
+        let first_id = format!("ok-{}", Uuid::new_v4());
+        let second_id = format!("ok-{}", Uuid::new_v4());
+        let provider = create_provider(
+            &pool,
+            &name,
+            "openai",
+            "http://127.0.0.1:9",
+            None,
+        )
+        .await
+        .expect("provider");
+        create_model(
+            &pool,
+            &first_id,
+            &provider.id,
+            "upstream-a",
+            None,
+            None,
+        )
+        .await
+        .expect("first model");
+        let providers = vec![crate::config::SeedProvider {
+            name: name.clone(),
+            kind: "openai".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: None,
+            models: vec![
+                crate::config::SeedModel {
+                    id: first_id.clone(),
+                    upstream_model: "upstream-a".into(),
+                    display_name: None,
+                    capability: None,
+                },
+                crate::config::SeedModel {
+                    id: second_id.clone(),
+                    upstream_model: "upstream-b".into(),
+                    display_name: None,
+                    capability: None,
+                },
+            ],
+        }];
+        assert_eq!(seed_catalog(&pool, &providers).await.expect("resume"), 1);
+        let models = list_models(&pool).await.expect("list");
+        assert!(models.iter().any(|m| m.id == first_id));
+        assert!(models.iter().any(|m| m.id == second_id));
     }
 }

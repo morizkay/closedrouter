@@ -190,37 +190,9 @@ async fn resolve_admin_token(db: &PgPool, from_env: Option<String>) -> anyhow::R
 }
 
 async fn seed_from_config(db: &PgPool, config: &Config) -> anyhow::Result<()> {
-    if config.providers.is_empty() {
-        return Ok(());
-    }
-    if db::model_count(db).await.unwrap_or(0) > 0 {
-        return Ok(());
-    }
-    for provider in &config.providers {
-        let record = db::create_provider(
-            db,
-            &provider.name,
-            &provider.kind,
-            &provider.base_url,
-            provider.api_key.as_deref(),
-        )
-        .await?;
-        for model in &provider.models {
-            db::create_model(
-                db,
-                &model.id,
-                &record.id,
-                &model.upstream_model,
-                model.display_name.as_deref(),
-                model.capability.as_deref(),
-            )
-            .await?;
-        }
-        tracing::info!(
-            provider = %provider.name,
-            models = provider.models.len(),
-            "seeded provider from config"
-        );
+    let inserted = db::seed_catalog(db, &config.providers).await?;
+    if inserted > 0 {
+        tracing::info!(models = inserted, "seeded catalog from config");
     }
     Ok(())
 }

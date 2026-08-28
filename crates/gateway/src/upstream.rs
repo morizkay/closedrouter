@@ -356,8 +356,8 @@ async fn pipe_stream(
                         } else {
                             convert_openai_line(&line, &mut openai_started)
                         };
-                        for frame in frames {
-                            yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("{frame}\n\n")));
+                        for message in serialize_sse_frames(frames) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(message));
                         }
                     }
                 }
@@ -408,6 +408,30 @@ fn convert_openai_line(line: &str, started: &mut bool) -> Vec<String> {
         return Vec::new();
     };
     openai_data_to_anthropic_sse(data.trim(), started)
+}
+
+/// Group converter output into SSE messages.
+///
+/// Anthropic streams are paired `event:` + `data:` lines that must share a
+/// single terminating blank line. OpenAI-family frames are already one `data:`
+/// line each.
+fn serialize_sse_frames(frames: Vec<String>) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut index = 0;
+    while index < frames.len() {
+        let frame = &frames[index];
+        if frame.starts_with("event:")
+            && index + 1 < frames.len()
+            && frames[index + 1].starts_with("data:")
+        {
+            messages.push(format!("{frame}\n{}\n\n", frames[index + 1]));
+            index += 2;
+        } else {
+            messages.push(format!("{frame}\n\n"));
+            index += 1;
+        }
+    }
+    messages
 }
 
 #[cfg(test)]
@@ -546,5 +570,43 @@ mod tests {
         .expect("proxy");
         assert!(res.status().is_success());
         assert_eq!(meta.completion_tokens, Some(1));
+    }
+
+    #[test]
+    fn anthropic_event_data_pairs_share_one_blank_line() {
+        let frames = vec![
+            "event: message_stop".into(),
+            "data: {\"type\":\"message_stop\"}".into(),
+            "event: ping".into(),
+            "data: {}".into(),
+        ];
+        let messages = serialize_sse_frames(frames);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0],
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        assert_eq!(messages[1], "event: ping\ndata: {}\n\n");
+    }
+
+    #[test]
+    fn openai_data_frames_stay_separate_messages() {
+        let frames = vec!["data: {\"x\":1}".into(), "data: [DONE]".into()];
+        let messages = serialize_sse_frames(frames);
+        assert_eq!(
+            messages,
+            vec!["data: {\"x\":1}\n\n".to_string(), "data: [DONE]\n\n".to_string()]
+        );
+    }
+
+    #[test]
+    fn openai_to_anthropic_converter_pairs_are_one_sse_message() {
+        let frames = openai_data_to_anthropic_sse("[DONE]", &mut true);
+        let messages = serialize_sse_frames(frames);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with("event: message_stop\n"));
+        assert!(messages[0].contains("data: {\"type\":\"message_stop\"}"));
+        assert!(messages[0].ends_with("\n\n"));
+        assert_eq!(messages[0].matches("\n\n").count(), 1);
     }
 }
