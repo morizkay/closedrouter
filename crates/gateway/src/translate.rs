@@ -2,6 +2,7 @@
 
 use crate::error::{AppError, AppResult};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 
 /// Wire protocol a client or upstream speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -739,8 +740,39 @@ pub fn anthropic_event_to_openai_sse(
     lines
 }
 
+/// Streaming translator state for OpenAI-family SSE → Anthropic SSE.
+#[derive(Debug, Default)]
+pub struct OpenaiToAnthropicSse {
+    started: bool,
+    next_block: u64,
+    text_block: Option<u64>,
+    /// OpenAI `tool_calls[].index` → Anthropic content-block index.
+    tools: HashMap<u64, u64>,
+    open_blocks: Vec<u64>,
+}
+
+impl OpenaiToAnthropicSse {
+    fn alloc_block(&mut self) -> u64 {
+        let index = self.next_block;
+        self.next_block += 1;
+        self.open_blocks.push(index);
+        index
+    }
+}
+
+/// Map an OpenAI-family `finish_reason` to Anthropic `stop_reason`.
+/// Unknown values (including `content_filter`) default to `end_turn`.
+fn openai_finish_reason_to_anthropic(reason: &str) -> &'static str {
+    match reason {
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        _ => "end_turn",
+    }
+}
+
 /// Convert a parsed OpenAI SSE data payload into Anthropic SSE events.
-pub fn openai_data_to_anthropic_sse(data: &str, started: &mut bool) -> Vec<String> {
+pub fn openai_data_to_anthropic_sse(data: &str, state: &mut OpenaiToAnthropicSse) -> Vec<String> {
     if data.trim() == "[DONE]" {
         return vec![
             "event: message_stop".into(),
@@ -751,8 +783,8 @@ pub fn openai_data_to_anthropic_sse(data: &str, started: &mut bool) -> Vec<Strin
         return Vec::new();
     };
     let mut out = Vec::new();
-    if !*started {
-        *started = true;
+    if !state.started {
+        state.started = true;
         let id = value
             .get("id")
             .and_then(Value::as_str)
@@ -776,17 +808,30 @@ pub fn openai_data_to_anthropic_sse(data: &str, started: &mut bool) -> Vec<Strin
         });
         out.push("event: message_start".into());
         out.push(format!("data: {start}"));
-        out.push("event: content_block_start".into());
-        out.push("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}".into());
     }
     if let Some(text) = value
         .pointer("/choices/0/delta/content")
         .and_then(Value::as_str)
     {
         if !text.is_empty() {
+            let index = match state.text_block {
+                Some(index) => index,
+                None => {
+                    let index = state.alloc_block();
+                    state.text_block = Some(index);
+                    let start = json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "text", "text": ""}
+                    });
+                    out.push("event: content_block_start".into());
+                    out.push(format!("data: {start}"));
+                    index
+                }
+            };
             let delta = json!({
                 "type": "content_block_delta",
-                "index": 0,
+                "index": index,
                 "delta": {"type": "text_delta", "text": text}
             });
             out.push("event: content_block_delta".into());
@@ -800,22 +845,76 @@ pub fn openai_data_to_anthropic_sse(data: &str, started: &mut bool) -> Vec<Strin
         if !reason.is_empty() {
             let delta = json!({
                 "type": "content_block_delta",
-                "index": 0,
+                "index": state.text_block.unwrap_or(0),
                 "delta": {"type": "thinking_delta", "thinking": reason}
             });
             out.push("event: content_block_delta".into());
             out.push(format!("data: {delta}"));
         }
     }
-    if value
+    if let Some(calls) = value
+        .pointer("/choices/0/delta/tool_calls")
+        .and_then(Value::as_array)
+    {
+        for call in calls {
+            let openai_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let anthropic_index = match state.tools.get(&openai_index).copied() {
+                Some(index) => index,
+                None => {
+                    let index = state.alloc_block();
+                    state.tools.insert(openai_index, index);
+                    let id = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("toolu_closedrouter");
+                    let name = call
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    let start = json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": {}
+                        }
+                    });
+                    out.push("event: content_block_start".into());
+                    out.push(format!("data: {start}"));
+                    index
+                }
+            };
+            if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                if !args.is_empty() {
+                    let delta = json!({
+                        "type": "content_block_delta",
+                        "index": anthropic_index,
+                        "delta": {"type": "input_json_delta", "partial_json": args}
+                    });
+                    out.push("event: content_block_delta".into());
+                    out.push(format!("data: {delta}"));
+                }
+            }
+        }
+    }
+    if let Some(reason) = value
         .pointer("/choices/0/finish_reason")
         .and_then(Value::as_str)
-        .is_some()
     {
-        out.push("event: content_block_stop".into());
-        out.push("data: {\"type\":\"content_block_stop\",\"index\":0}".into());
+        let stop_reason = openai_finish_reason_to_anthropic(reason);
+        for index in std::mem::take(&mut state.open_blocks) {
+            let stop = json!({"type": "content_block_stop", "index": index});
+            out.push("event: content_block_stop".into());
+            out.push(format!("data: {stop}"));
+        }
+        let delta = json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": null}
+        });
         out.push("event: message_delta".into());
-        out.push("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}}".into());
+        out.push(format!("data: {delta}"));
     }
     out
 }
@@ -980,8 +1079,92 @@ mod tests {
 
     #[test]
     fn openai_sse_done() {
-        let lines = openai_data_to_anthropic_sse("[DONE]", &mut true);
+        let lines = openai_data_to_anthropic_sse("[DONE]", &mut OpenaiToAnthropicSse::default());
         assert_eq!(lines[0], "event: message_stop");
+    }
+
+    #[test]
+    fn openai_tool_call_chunks_become_anthropic_tool_use() {
+        let mut state = OpenaiToAnthropicSse::default();
+        let start = json!({
+            "id": "chatcmpl-1",
+            "model": "gpt",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": ""}
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let lines = openai_data_to_anthropic_sse(&start, &mut state);
+        let joined = lines.join("\n");
+        assert!(joined.contains("\"type\":\"tool_use\""));
+        assert!(joined.contains("call_1"));
+        assert!(joined.contains("get_weather"));
+        assert!(
+            !joined.contains("\"type\":\"text\""),
+            "tool-only streams must not open a text block"
+        );
+
+        let args = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": "{\"city\":\"sf\"}"}
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let lines = openai_data_to_anthropic_sse(&args, &mut state);
+        let joined = lines.join("\n");
+        assert!(joined.contains("input_json_delta"));
+        assert!(joined.contains("city"));
+    }
+
+    #[test]
+    fn openai_finish_reason_maps_to_anthropic_stop_reason() {
+        for (openai, anthropic) in [
+            ("stop", "end_turn"),
+            ("length", "max_tokens"),
+            ("tool_calls", "tool_use"),
+            ("content_filter", "end_turn"),
+        ] {
+            let mut state = OpenaiToAnthropicSse::default();
+            let start = json!({
+                "id": "c",
+                "model": "m",
+                "choices": [{"delta": {"content": "x"}}]
+            })
+            .to_string();
+            openai_data_to_anthropic_sse(&start, &mut state);
+            let finish = json!({
+                "choices": [{"delta": {}, "finish_reason": openai}]
+            })
+            .to_string();
+            let lines = openai_data_to_anthropic_sse(&finish, &mut state);
+            let stop = lines.iter().find_map(|line| {
+                let data = line.strip_prefix("data: ")?;
+                let value: Value = serde_json::from_str(data).ok()?;
+                if value.get("type").and_then(Value::as_str) == Some("message_delta") {
+                    value
+                        .pointer("/delta/stop_reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                } else {
+                    None
+                }
+            });
+            assert_eq!(stop.as_deref(), Some(anthropic), "openai finish {openai}");
+        }
     }
 
     #[test]

@@ -175,18 +175,35 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
 
 async fn resolve_admin_token(db: &PgPool, from_env: Option<String>) -> anyhow::Result<String> {
     if let Some(token) = from_env {
-        db::set_setting(db, "admin_token", &token).await.ok();
-        return Ok(token);
+        ensure_secure_admin_token(&token)?;
+        db::set_setting(db, "admin_token", token.trim()).await.ok();
+        return Ok(token.trim().to_string());
     }
     if let Ok(Some(existing)) = db::get_setting(db, "admin_token").await {
-        if !existing.is_empty() {
+        if !is_insecure_admin_token(&existing) {
             return Ok(existing);
         }
+        tracing::warn!("ignoring insecure persisted admin token");
     }
     let token = db::generate_admin_token();
     db::set_setting(db, "admin_token", &token).await?;
     tracing::warn!(token, "generated admin token (also stored in the database)");
     Ok(token)
+}
+
+/// Public example / empty secrets that must never protect admin routes.
+fn is_insecure_admin_token(token: &str) -> bool {
+    let token = token.trim();
+    token.is_empty() || token.eq_ignore_ascii_case("change-me-now")
+}
+
+fn ensure_secure_admin_token(token: &str) -> anyhow::Result<()> {
+    if is_insecure_admin_token(token) {
+        anyhow::bail!(
+            "ADMIN_TOKEN is empty or the public example value 'change-me-now'; set a unique secret in .env"
+        );
+    }
+    Ok(())
 }
 
 async fn seed_from_config(db: &PgPool, config: &Config) -> anyhow::Result<()> {
@@ -317,6 +334,17 @@ mod tests {
             config: Arc::new(Config::default()),
             metrics,
         })
+    }
+
+    #[test]
+    fn insecure_admin_token_rejected() {
+        assert!(is_insecure_admin_token(""));
+        assert!(is_insecure_admin_token("   "));
+        assert!(is_insecure_admin_token("change-me-now"));
+        assert!(is_insecure_admin_token("Change-Me-Now"));
+        assert!(ensure_secure_admin_token("change-me-now").is_err());
+        assert!(ensure_secure_admin_token("a-unique-secret").is_ok());
+        assert!(!is_insecure_admin_token("a-unique-secret"));
     }
 }
 

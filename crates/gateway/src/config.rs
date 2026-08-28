@@ -149,9 +149,7 @@ impl Config {
             }
         }
         if let Ok(token) = env::var("ADMIN_TOKEN") {
-            if !token.is_empty() {
-                config.admin_token = Some(token);
-            }
+            config.admin_token = Some(token);
         }
         if let Ok(origins) = env::var("CORS_ORIGINS") {
             if origins.trim() == "*" {

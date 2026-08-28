@@ -1,6 +1,6 @@
 # API reference
 
-Base URL is the gateway origin (default `http://localhost:8080`). ClosedRouter keys (`sk-cr-…`) go in `Authorization: Bearer` or `x-api-key`. Admin calls use `ADMIN_TOKEN` the same way, or `x-admin-token`.
+Base URL is the gateway origin (default `http://localhost:8080`). ClosedRouter keys (`sk-cr-…`) go in `Authorization: Bearer` or `x-api-key`. Admin calls use `ADMIN_TOKEN` the same way, or `x-admin-token`. Compose requires `ADMIN_TOKEN` in `.env`; the gateway refuses empty values and the example placeholder `change-me-now`.
 
 ## Health and metrics
 

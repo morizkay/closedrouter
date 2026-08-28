@@ -6,7 +6,8 @@ use crate::observability;
 use crate::translate::{
     anthropic_event_to_openai_sse, anthropic_response_to_openai, anthropic_to_openai,
     extract_model, extract_stream, openai_chunk_id, openai_data_to_anthropic_sse,
-    openai_response_to_anthropic, openai_to_anthropic, rewrite_model, usage_from_body, Protocol,
+    openai_response_to_anthropic, openai_to_anthropic, rewrite_model, usage_from_body,
+    OpenaiToAnthropicSse, Protocol,
 };
 use anyhow::Context;
 use axum::body::Body;
@@ -333,29 +334,23 @@ async fn pipe_stream(
     let to_openai = incoming.is_openai_family() && upstream == Protocol::Anthropic;
     let byte_stream = response.bytes_stream();
     let converted = async_stream::stream! {
-        let mut rest = String::new();
-        let mut openai_started = false;
+        let mut rest = Vec::new();
+        let mut openai_sse = OpenaiToAnthropicSse::default();
         let mut current_event = String::new();
         futures_util::pin_mut!(byte_stream);
         while let Some(chunk) = byte_stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    rest.push_str(&String::from_utf8_lossy(&bytes));
-                    loop {
-                        let Some(idx) = rest.find('\n') else { break };
-                        let mut line = rest[..idx].to_string();
-                        rest = rest[idx + 1..].to_string();
-                        if line.ends_with('\r') {
-                            line.pop();
-                        }
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let frames = if to_openai {
-                            convert_anthropic_line(&line, &mut current_event, &id, &model_owned)
-                        } else {
-                            convert_openai_line(&line, &mut openai_started)
-                        };
+                    let lines = push_sse_bytes(&mut rest, &bytes);
+                    for line in lines {
+                        let frames = translate_sse_line(
+                            &line,
+                            to_openai,
+                            &mut current_event,
+                            &mut openai_sse,
+                            &id,
+                            &model_owned,
+                        );
                         for message in serialize_sse_frames(frames) {
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(message));
                         }
@@ -365,6 +360,19 @@ async fn pipe_stream(
                     yield Err(std::io::Error::other(err.to_string()));
                     break;
                 }
+            }
+        }
+        for line in flush_sse_bytes(&mut rest) {
+            let frames = translate_sse_line(
+                &line,
+                to_openai,
+                &mut current_event,
+                &mut openai_sse,
+                &id,
+                &model_owned,
+            );
+            for message in serialize_sse_frames(frames) {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(message));
             }
         }
     };
@@ -403,11 +411,75 @@ fn convert_anthropic_line(
     Vec::new()
 }
 
-fn convert_openai_line(line: &str, started: &mut bool) -> Vec<String> {
+fn convert_openai_line(line: &str, state: &mut OpenaiToAnthropicSse) -> Vec<String> {
     let Some(data) = line.strip_prefix("data:") else {
         return Vec::new();
     };
-    openai_data_to_anthropic_sse(data.trim(), started)
+    openai_data_to_anthropic_sse(data.trim(), state)
+}
+
+fn translate_sse_line(
+    line: &str,
+    to_openai: bool,
+    current_event: &mut String,
+    openai_sse: &mut OpenaiToAnthropicSse,
+    id: &str,
+    model: &str,
+) -> Vec<String> {
+    if line.is_empty() {
+        return Vec::new();
+    }
+    if to_openai {
+        convert_anthropic_line(line, current_event, id, model)
+    } else {
+        convert_openai_line(line, openai_sse)
+    }
+}
+
+/// Append raw HTTP bytes and return SSE lines that are complete (newline-terminated)
+/// and valid UTF-8. Incomplete trailing bytes stay in `buf` so a multibyte character
+/// split across chunks is decoded only once the rest arrives.
+fn push_sse_bytes(buf: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+    buf.extend_from_slice(chunk);
+    drain_complete_sse_lines(buf)
+}
+
+fn drain_complete_sse_lines(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    loop {
+        let Some(idx) = buf.iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let mut remainder = buf.split_off(idx + 1);
+        std::mem::swap(buf, &mut remainder);
+        let mut line = remainder;
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(s) = String::from_utf8(line) {
+            lines.push(s);
+        }
+    }
+    lines
+}
+
+/// Decode a trailing unterminated line at end-of-stream when it is valid UTF-8.
+fn flush_sse_bytes(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = drain_complete_sse_lines(buf);
+    if buf.is_empty() {
+        return lines;
+    }
+    if let Ok(s) = String::from_utf8(std::mem::take(buf)) {
+        let s = s.trim_end_matches('\r');
+        if !s.is_empty() {
+            lines.push(s.to_string());
+        }
+    }
+    lines
 }
 
 /// Group converter output into SSE messages.
@@ -601,12 +673,31 @@ mod tests {
 
     #[test]
     fn openai_to_anthropic_converter_pairs_are_one_sse_message() {
-        let frames = openai_data_to_anthropic_sse("[DONE]", &mut true);
+        let frames = openai_data_to_anthropic_sse("[DONE]", &mut OpenaiToAnthropicSse::default());
         let messages = serialize_sse_frames(frames);
         assert_eq!(messages.len(), 1);
         assert!(messages[0].starts_with("event: message_stop\n"));
         assert!(messages[0].contains("data: {\"type\":\"message_stop\"}"));
         assert!(messages[0].ends_with("\n\n"));
         assert_eq!(messages[0].matches("\n\n").count(), 1);
+    }
+
+    #[test]
+    fn utf8_character_split_across_chunks_survives() {
+        let line = "data: {\"text\":\"café\"}\n";
+        let bytes = line.as_bytes();
+        let split = bytes
+            .windows(2)
+            .position(|window| window == [0xC3, 0xA9])
+            .expect("é is U+00E9 utf-8 c3 a9")
+            + 1;
+        let mut buf = Vec::new();
+        let first = push_sse_bytes(&mut buf, &bytes[..split]);
+        assert!(first.is_empty(), "incomplete line must stay buffered");
+        assert!(!buf.is_empty());
+        let second = push_sse_bytes(&mut buf, &bytes[split..]);
+        assert_eq!(second, vec!["data: {\"text\":\"café\"}".to_string()]);
+        assert!(buf.is_empty());
+        assert!(!second[0].contains('\u{FFFD}'));
     }
 }

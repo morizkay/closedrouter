@@ -27,7 +27,7 @@ services:
       HOST: 0.0.0.0
       PORT: 8080
       DATABASE_URL: postgres://${POSTGRES_USER:-closedrouter}:${POSTGRES_PASSWORD:-closedrouter}@postgres:5432/${POSTGRES_DB:-closedrouter}
-      ADMIN_TOKEN: ${ADMIN_TOKEN:-change-me-now}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN to a unique secret in .env (not change-me-now)}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-}

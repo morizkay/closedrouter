@@ -10,6 +10,8 @@ Slim stack — Postgres, gateway, dashboard:
 
 ```bash
 cp .env.example .env
+# Set ADMIN_TOKEN to a unique secret (required). Compose will not start without it:
+#   openssl rand -hex 24
 docker compose up --build
 ```
 
@@ -33,7 +35,7 @@ docker compose --profile full up --build
 | Langfuse | — | :3001 / `http://langfuse.localhost` |
 | Traefik | — | :80 (dashboard :8081) |
 
-Sign in to the dashboard with `ADMIN_TOKEN` from `.env`. Create an API key, add a provider, and map a friendly model ID.
+Sign in to the dashboard with `ADMIN_TOKEN` from `.env`. Create an API key, add a provider, and map a friendly model ID. The gateway refuses to start if `ADMIN_TOKEN` is empty or the example value `change-me-now`.
 
 ## Without Docker
 
@@ -162,7 +164,7 @@ See `.env.example` and `config.example.yaml`.
 
 - `HOST` / `PORT` — gateway bind (`0.0.0.0` for Docker/cloud)
 - `DATABASE_URL` — Postgres (required)
-- `ADMIN_TOKEN` — dashboard secret
+- `ADMIN_TOKEN` — dashboard secret (required in Compose; gateway rejects empty/`change-me-now`)
 - `CORS_ORIGINS` — comma-separated, or `*`
 - `EMBEDDING_MODEL` — catalog id for Hermes `embed: true`
 - `LANGFUSE_*` — optional trace export
