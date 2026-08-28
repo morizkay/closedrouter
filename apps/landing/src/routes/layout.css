@@ -1,0 +1,34 @@
+@import 'tailwindcss';
+@plugin '@tailwindcss/typography';
+
+@theme {
+	--font-sans: 'Outfit', ui-sans-serif, system-ui, sans-serif;
+	--font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+	--color-ink: #06070a;
+	--color-panel: #0d0f14;
+	--color-line: rgb(255 255 255 / 0.08);
+	--color-mist: #9a9aaa;
+	--color-paper: #f4f1ea;
+	--color-acid: #c6ff4a;
+	--color-ice: #7dd3fc;
+}
+
+html {
+	background: var(--color-ink);
+	color: var(--color-paper);
+	scroll-behavior: smooth;
+}
+
+body {
+	font-family: var(--font-sans);
+	min-height: 100vh;
+	background:
+		radial-gradient(1200px 600px at 10% -10%, rgb(198 255 74 / 0.08), transparent 50%),
+		radial-gradient(900px 500px at 90% 0%, rgb(125 211 252 / 0.07), transparent 45%),
+		var(--color-ink);
+}
+
+::selection {
+	background: var(--color-acid);
+	color: #081000;
+}
