@@ -1,4 +1,6 @@
-CREATE EXTENSION IF NOT EXISTS vector;
+-- The `vector` extension is created from Rust (`ensure_vector_extension`)
+-- under an advisory lock so parallel tests/processes cannot race
+-- `pg_extension_name_index`. Tables below are idempotent.
 
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,

@@ -8,6 +8,22 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: closedrouter
+          POSTGRES_PASSWORD: closedrouter
+          POSTGRES_DB: closedrouter
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U closedrouter -d closedrouter"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://closedrouter:closedrouter@localhost:5432/closedrouter
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -16,7 +32,7 @@ jobs:
       - name: clippy
         run: cargo clippy -p closedrouter-gateway --all-targets -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace -- --nocapture
 
   dashboard:
     runs-on: ubuntu-latest

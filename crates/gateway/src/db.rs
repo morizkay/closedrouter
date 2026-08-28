@@ -8,10 +8,16 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
+use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 const EMBEDDING_DIM: usize = 1536;
 const SCHEMA_SQL: &str = include_str!("schema.sql");
+/// Session advisory-lock key for installing `vector` (must be stable across processes).
+const VECTOR_EXTENSION_LOCK: i64 = 731_882_001;
+static APPLY_SCHEMA: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
 /// Public API key row (never includes the hash).
 #[derive(Debug, Clone, Serialize)]
@@ -115,10 +121,59 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
     Ok(pool)
 }
 
-/// Apply `schema.sql`. Safe to run on every boot.
+/// Apply `schema.sql`. Safe to run on every boot, including parallel test processes.
 pub async fn apply_schema(pool: &PgPool) -> anyhow::Result<()> {
+    let lock = APPLY_SCHEMA.get_or_init(|| AsyncMutex::new(()));
+    let _guard = lock.lock().await;
+    ensure_vector_extension(pool).await?;
     sqlx::raw_sql(SCHEMA_SQL).execute(pool).await?;
     Ok(())
+}
+
+fn is_benign_extension_error(err: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db) = err {
+        // unique_violation, duplicate_object, duplicate_function
+        if let Some("23505" | "42710" | "42723") = db.code().as_deref() {
+            return true;
+        }
+    }
+    let msg = err.to_string();
+    msg.contains("pg_extension_name_index") || msg.contains("already exists")
+}
+
+/// `CREATE EXTENSION IF NOT EXISTS` is not race-safe: concurrent sessions can both
+/// pass the existence check and then conflict on `pg_extension_name_index`.
+async fn ensure_vector_extension(pool: &PgPool) -> anyhow::Result<()> {
+    let mut last_err: Option<sqlx::Error> = None;
+    for attempt in 0..8u32 {
+        let mut conn = pool.acquire().await?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(VECTOR_EXTENSION_LOCK)
+            .execute(&mut *conn)
+            .await?;
+        let created = sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+            .execute(&mut *conn)
+            .await;
+        if let Err(err) = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(VECTOR_EXTENSION_LOCK)
+            .execute(&mut *conn)
+            .await
+        {
+            tracing::warn!(error = %err, "failed to release vector extension advisory lock");
+        }
+        match created {
+            Ok(_) => return Ok(()),
+            Err(err) if is_benign_extension_error(&err) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                let backoff_ms = 25u64.saturating_mul(1u64 << attempt.min(4));
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    Err(last_err.map(Into::into).unwrap_or_else(|| {
+        anyhow::anyhow!("failed to create the pgvector `vector` extension")
+    }))
 }
 
 fn ts(dt: DateTime<Utc>) -> i64 {
@@ -921,14 +976,48 @@ mod tests {
         assert!(vector_from_values(vec![0.0; EMBEDDING_DIM]).is_ok());
     }
 
+    #[test]
+    fn extension_unique_violation_is_benign() {
+        let err = sqlx::Error::Protocol(
+            "duplicate key value violates unique constraint \"pg_extension_name_index\"".into(),
+        );
+        assert!(is_benign_extension_error(&err));
+    }
+
+    #[tokio::test]
+    async fn apply_schema_is_safe_concurrently() {
+        let Some(url) = crate::test_support::postgres_url().await else {
+            assert!(
+                !crate::test_support::database_url_configured(),
+                "DATABASE_URL is set but Postgres is unreachable"
+            );
+            eprintln!("skipping postgres concurrent schema test");
+            return;
+        };
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let url = url.clone();
+            joins.push(tokio::spawn(async move { connect(&url).await.map(|_| ()) }));
+        }
+        for join in joins {
+            join.await
+                .expect("task join")
+                .expect("connect+apply_schema");
+        }
+    }
+
     #[tokio::test]
     async fn hermes_store_list_and_text_search() {
-        let Some(url) = crate::test_support::postgres_url().await else {
+        let Some(pool) = crate::test_support::test_pool().await else {
+            assert!(
+                !crate::test_support::database_url_configured(),
+                "DATABASE_URL is set but Postgres is unreachable"
+            );
             eprintln!("skipping postgres hermes test");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
-        let (key, _plain) = create_api_key(&pool, "hermes-test")
+        let marker = format!("user prefers terse answers {}", Uuid::new_v4());
+        let (key, _plain) = create_api_key(&pool, &format!("hermes-test-{}", Uuid::new_v4()))
             .await
             .expect("key");
         let session = create_hermes_session(&pool, &key.id, Some("t"))
@@ -937,7 +1026,7 @@ mod tests {
         store_hermes_memory(
             &pool,
             &key.id,
-            "user prefers terse answers",
+            &marker,
             Some(&session.id),
             Some("hermes"),
             serde_json::json!({"k": 1}),
@@ -952,7 +1041,7 @@ mod tests {
         let found = search_hermes_memories(
             &pool,
             &key.id,
-            Some("terse"),
+            Some(&marker),
             None,
             Some(&session.id),
             Some("hermes"),

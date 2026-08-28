@@ -290,6 +290,10 @@ mod tests {
     #[tokio::test]
     async fn health_ok_without_catalog() {
         let Some(state) = test_state().await else {
+            assert!(
+                !crate::test_support::database_url_configured(),
+                "DATABASE_URL is set but Postgres is unreachable"
+            );
             eprintln!("skipping: DATABASE_URL unset and testcontainers unavailable");
             return;
         };
@@ -309,6 +313,10 @@ mod tests {
     #[tokio::test]
     async fn completions_reject_missing_key() {
         let Some(state) = test_state().await else {
+            assert!(
+                !crate::test_support::database_url_configured(),
+                "DATABASE_URL is set but Postgres is unreachable"
+            );
             eprintln!("skipping: DATABASE_URL unset and testcontainers unavailable");
             return;
         };
@@ -328,11 +336,7 @@ mod tests {
     }
 
     async fn test_state() -> Option<AppState> {
-        let url = match crate::test_support::postgres_url().await {
-            Some(u) => u,
-            None => return None,
-        };
-        let db = db::connect(&url).await.ok()?;
+        let db = crate::test_support::test_pool().await?;
         let metrics = observability::install_metrics().ok()?;
         Some(AppState {
             db,
@@ -347,21 +351,30 @@ mod tests {
 /// Test helpers (Postgres URL via env or testcontainers).
 #[cfg(test)]
 pub mod test_support {
+    use sqlx::PgPool;
     use std::sync::OnceLock;
     use tokio::sync::Mutex;
 
     static URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    static POOL: OnceLock<Mutex<Option<PgPool>>> = OnceLock::new();
+
+    pub fn database_url_configured() -> bool {
+        std::env::var("DATABASE_URL")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
 
     pub async fn postgres_url() -> Option<String> {
-        if let Ok(url) = std::env::var("DATABASE_URL") {
-            if !url.is_empty() {
-                return Some(url);
-            }
-        }
         let slot = URL.get_or_init(|| Mutex::new(None));
         let mut guard = slot.lock().await;
         if let Some(url) = guard.as_ref() {
             return Some(url.clone());
+        }
+        if let Ok(url) = std::env::var("DATABASE_URL") {
+            if !url.is_empty() {
+                *guard = Some(url.clone());
+                return Some(url);
+            }
         }
         match start_pgvector().await {
             Ok(url) => {
@@ -370,6 +383,26 @@ pub mod test_support {
             }
             Err(err) => {
                 eprintln!("testcontainers postgres skipped: {err}");
+                None
+            }
+        }
+    }
+
+    /// Shared pool so parallel tests apply schema once against one database.
+    pub async fn test_pool() -> Option<PgPool> {
+        let slot = POOL.get_or_init(|| Mutex::new(None));
+        let mut guard = slot.lock().await;
+        if let Some(pool) = guard.as_ref() {
+            return Some(pool.clone());
+        }
+        let url = postgres_url().await?;
+        match crate::db::connect(&url).await {
+            Ok(pool) => {
+                *guard = Some(pool.clone());
+                Some(pool)
+            }
+            Err(err) => {
+                eprintln!("postgres connect failed: {err:#}");
                 None
             }
         }
