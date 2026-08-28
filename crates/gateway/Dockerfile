@@ -2,7 +2,7 @@
 
 FROM rust:1.88-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 RUN cargo build --release -p closedrouter-gateway
 
