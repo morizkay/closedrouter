@@ -5,6 +5,10 @@ global:
 scrape_configs:
   - job_name: closedrouter
     metrics_path: /metrics
+    # /metrics requires METRICS_TOKEN or ADMIN_TOKEN as Bearer / x-metrics-token.
+    # authorization:
+    #   type: Bearer
+    #   credentials: <same value as gateway METRICS_TOKEN or ADMIN_TOKEN>
     static_configs:
       - targets:
           - gateway:8080

@@ -90,3 +90,26 @@ impl FromRequestParts<crate::AppState> for AdminAuth {
         Ok(AdminAuth)
     }
 }
+
+/// `/metrics` accepts `METRICS_TOKEN` (or admin credentials when no scrape token is set).
+pub fn metrics_authorized(headers: &HeaderMap, state: &crate::AppState) -> bool {
+    if let Some(expected) = state.metrics_token.as_deref().filter(|t| !t.is_empty()) {
+        if let Some(token) = metrics_token_from(headers) {
+            return token == expected;
+        }
+    }
+    admin_token_from(headers)
+        .is_some_and(|token| token == state.admin_token)
+}
+
+fn metrics_token_from(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get("x-metrics-token") {
+        if let Ok(raw) = value.to_str() {
+            let token = raw.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    bearer_from(headers)
+}

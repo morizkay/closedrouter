@@ -38,6 +38,8 @@ services:
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      ALLOW_PRIVATE_UPSTREAM_HOSTS: ${ALLOW_PRIVATE_UPSTREAM_HOSTS:-}
     volumes:
       - ./crates/gateway/config.docker.yaml:/etc/closedrouter/config.yaml:ro
     depends_on:

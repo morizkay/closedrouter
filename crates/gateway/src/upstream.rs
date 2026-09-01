@@ -3,21 +3,23 @@
 use crate::db::ProviderSecret;
 use crate::error::{AppError, AppResult};
 use crate::observability;
+use crate::pinned_http;
 use crate::translate::{
     anthropic_event_to_openai_sse, anthropic_response_to_openai, anthropic_to_openai,
     extract_model, extract_stream, openai_chunk_id, openai_data_to_anthropic_sse,
     openai_response_to_anthropic, openai_to_anthropic, rewrite_model, usage_from_body,
     OpenaiToAnthropicSse, Protocol,
 };
-use anyhow::Context;
+use crate::url_policy::UpstreamUrlPolicy;
 use axum::body::Body;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::RequestBuilder;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::time::Instant;
+use tokio::sync::oneshot;
 
 /// Outcome of a proxied call, used for logs / Langfuse / Prometheus.
 #[derive(Debug, Clone, Default)]
@@ -29,12 +31,8 @@ pub struct ProxyMeta {
     pub error: Option<String>,
 }
 
-pub fn http_client() -> anyhow::Result<Client> {
-    Client::builder()
-        .timeout(Duration::from_secs(600))
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .context("build HTTP client")
+pub fn http_client() -> anyhow::Result<reqwest::Client> {
+    pinned_http::http_client()
 }
 
 fn join_url(base: &str, path: &str) -> String {
@@ -54,9 +52,9 @@ fn embeddings_url(provider: &ProviderSecret) -> String {
 }
 
 fn apply_upstream_auth(
-    builder: reqwest::RequestBuilder,
+    builder: RequestBuilder,
     provider: &ProviderSecret,
-) -> reqwest::RequestBuilder {
+) -> RequestBuilder {
     match provider.kind.as_str() {
         "anthropic" => {
             let mut b = builder.header("anthropic-version", "2023-06-01");
@@ -82,14 +80,21 @@ fn apply_upstream_auth(
     }
 }
 
+/// Token usage observed from a completed SSE stream.
+#[derive(Debug, Clone, Default)]
+pub struct StreamUsage {
+    pub prompt_tokens: Option<i32>,
+    pub completion_tokens: Option<i32>,
+}
+
 /// Proxy a chat completion / messages request, translating as needed.
 pub async fn proxy(
-    client: &Client,
+    policy: &UpstreamUrlPolicy,
     incoming: Protocol,
     provider: &ProviderSecret,
     upstream_model: &str,
     body: Value,
-) -> AppResult<(Response, ProxyMeta)> {
+) -> AppResult<(Response, ProxyMeta, Option<oneshot::Receiver<StreamUsage>>)> {
     let started = Instant::now();
     let upstream_kind = Protocol::from_kind(&provider.kind)?;
     let stream = extract_stream(&body);
@@ -120,13 +125,17 @@ pub async fn proxy(
         "proxying completion"
     );
 
-    let request = apply_upstream_auth(client.post(&url).json(&payload), provider);
-    let response = request.send().await?;
+    let response = pinned_http::send_pinned(&url, policy, |client, url| {
+        apply_upstream_auth(client.post(url).json(&payload), provider)
+    })
+    .await?;
+    let upstream_headers = response.headers().clone();
     let status_code = response.status().as_u16();
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
 
-    if stream {
-        let res = pipe_stream(incoming, upstream_kind, upstream_model, response, status).await?;
+    if stream && status.is_success() {
+        let (res, usage_rx) =
+            pipe_stream(incoming, upstream_kind, upstream_model, response, status).await?;
         let latency_ms = started.elapsed().as_millis() as u64;
         observability::record_request(
             incoming.as_str(),
@@ -150,6 +159,11 @@ pub async fn proxy(
                 completion_tokens: None,
                 error,
             },
+            if status.is_success() {
+                Some(usage_rx)
+            } else {
+                None
+            },
         ));
     }
 
@@ -166,7 +180,7 @@ pub async fn proxy(
         );
         let message = String::from_utf8_lossy(&bytes).chars().take(500).collect();
         return Ok((
-            json_passthrough(status, bytes),
+            build_upstream_json_response(status, bytes, &upstream_headers),
             ProxyMeta {
                 status: status_code,
                 latency_ms,
@@ -174,6 +188,7 @@ pub async fn proxy(
                 completion_tokens: None,
                 error: Some(message),
             },
+            None,
         ));
     }
 
@@ -207,7 +222,7 @@ pub async fn proxy(
     );
 
     Ok((
-        json_passthrough(status, out_bytes),
+        build_upstream_json_response(status, out_bytes, &upstream_headers),
         ProxyMeta {
             status: status_code,
             latency_ms,
@@ -215,12 +230,13 @@ pub async fn proxy(
             completion_tokens: completion,
             error: None,
         },
+        None,
     ))
 }
 
 /// OpenAI-compatible embeddings against an OpenAI-family provider.
 pub async fn embeddings(
-    client: &Client,
+    policy: &UpstreamUrlPolicy,
     provider: &ProviderSecret,
     upstream_model: &str,
     mut body: Value,
@@ -234,18 +250,20 @@ pub async fn embeddings(
     }
     body = rewrite_model(body, upstream_model);
     let url = embeddings_url(provider);
-    let response = apply_upstream_auth(client.post(&url).json(&body), provider)
-        .send()
-        .await?;
+    let response = pinned_http::send_pinned(&url, policy, |client, url| {
+        apply_upstream_auth(client.post(url).json(&body), provider)
+    })
+    .await?;
+    let upstream_headers = response.headers().clone();
     let status_code = response.status().as_u16();
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
     let bytes = response.bytes().await?;
-    Ok(json_passthrough(status, bytes))
+    Ok(build_upstream_json_response(status, bytes, &upstream_headers))
 }
 
 /// Fetch a single embedding vector (1536-d expected by Hermes).
 pub async fn embed_text(
-    client: &Client,
+    policy: &UpstreamUrlPolicy,
     provider: &ProviderSecret,
     upstream_model: &str,
     input: &str,
@@ -255,9 +273,10 @@ pub async fn embed_text(
         "input": input,
     });
     let url = embeddings_url(provider);
-    let response = apply_upstream_auth(client.post(&url).json(&body), provider)
-        .send()
-        .await?;
+    let response = pinned_http::send_pinned(&url, policy, |client, url| {
+        apply_upstream_auth(client.post(url).json(&body), provider)
+    })
+    .await?;
     if !response.status().is_success() {
         let text = response.text().await.unwrap_or_default();
         return Err(AppError::Upstream(format!(
@@ -279,13 +298,64 @@ pub async fn embed_text(
     Ok(out)
 }
 
-fn json_passthrough(status: StatusCode, bytes: Bytes) -> Response {
+fn upstream_header_leaks_internal_destination(name: &str) -> bool {
+    matches!(
+        name,
+        "location" | "refresh" | "content-location" | "link"
+    )
+}
+
+/// Copy upstream response headers safe to expose to API clients.
+pub(crate) fn filter_upstream_response_headers(
+    status: StatusCode,
+    upstream: &reqwest::header::HeaderMap,
+) -> HeaderMap {
+    if status.is_success() {
+        return HeaderMap::new();
+    }
+
+    let mut headers = HeaderMap::new();
+    for (name, value) in upstream {
+        let lower = name.as_str().to_ascii_lowercase();
+        if upstream_header_leaks_internal_destination(&lower) {
+            continue;
+        }
+        if matches!(
+            lower.as_str(),
+            "content-type" | "content-length" | "retry-after"
+        ) {
+            if let (Ok(header_name), Ok(header_value)) = (
+                HeaderName::from_bytes(name.as_str().as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                headers.insert(header_name, header_value);
+            }
+        }
+    }
+    headers
+}
+
+fn build_upstream_json_response(
+    status: StatusCode,
+    bytes: Bytes,
+    upstream_headers: &reqwest::header::HeaderMap,
+) -> Response {
+    let mut headers = filter_upstream_response_headers(status, upstream_headers);
+    if !headers.contains_key(header::CONTENT_TYPE) {
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+
     match Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(bytes))
     {
-        Ok(res) => res,
+        Ok(mut res) => {
+            *res.headers_mut() = headers;
+            res
+        }
         Err(err) => {
             tracing::error!(error = %err, "failed to build JSON response");
             let mut res = Response::new(Body::from(
@@ -303,7 +373,8 @@ async fn pipe_stream(
     model: &str,
     response: reqwest::Response,
     status: StatusCode,
-) -> AppResult<Response> {
+) -> AppResult<(Response, oneshot::Receiver<StreamUsage>)> {
+    let (usage_tx, usage_rx) = oneshot::channel();
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -323,10 +394,11 @@ async fn pipe_stream(
         let byte_stream = response
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
-        let mut res = Response::new(Body::from_stream(byte_stream));
+        let tracked = track_stream_usage(byte_stream, usage_tx);
+        let mut res = Response::new(Body::from_stream(tracked));
         *res.status_mut() = status;
         *res.headers_mut() = headers;
-        return Ok(res);
+        return Ok((res, usage_rx));
     }
 
     let id = openai_chunk_id(model);
@@ -337,11 +409,15 @@ async fn pipe_stream(
         let mut rest = Vec::new();
         let mut openai_sse = OpenaiToAnthropicSse::default();
         let mut current_event = String::new();
+        let mut usage = StreamUsage::default();
         futures_util::pin_mut!(byte_stream);
         while let Some(chunk) = byte_stream.next().await {
             match chunk {
                 Ok(bytes) => {
                     let lines = push_sse_bytes(&mut rest, &bytes);
+                    for line in &lines {
+                        capture_usage_from_sse_line(line, &mut usage);
+                    }
                     for line in lines {
                         let frames = translate_sse_line(
                             &line,
@@ -363,6 +439,7 @@ async fn pipe_stream(
             }
         }
         for line in flush_sse_bytes(&mut rest) {
+            capture_usage_from_sse_line(&line, &mut usage);
             let frames = translate_sse_line(
                 &line,
                 to_openai,
@@ -375,12 +452,13 @@ async fn pipe_stream(
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(message));
             }
         }
+        let _ = usage_tx.send(usage);
     };
 
     let mut res = Response::new(Body::from_stream(converted));
     *res.status_mut() = status;
     *res.headers_mut() = headers;
-    Ok(res)
+    Ok((res, usage_rx))
 }
 
 fn convert_anthropic_line(
@@ -506,6 +584,71 @@ fn serialize_sse_frames(frames: Vec<String>) -> Vec<String> {
     messages
 }
 
+fn capture_usage_from_sse_bytes(buf: &mut Vec<u8>, chunk: &[u8], usage: &mut StreamUsage) {
+    let lines = push_sse_bytes(buf, chunk);
+    for line in lines {
+        capture_usage_from_sse_line(&line, usage);
+    }
+}
+
+fn capture_usage_from_sse_line(line: &str, usage: &mut StreamUsage) {
+    let Some(data) = line.strip_prefix("data:") else {
+        return;
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    merge_stream_usage(usage, &value);
+    if let Some(message) = value.get("message") {
+        merge_stream_usage(usage, message);
+    }
+}
+
+fn merge_stream_usage(usage: &mut StreamUsage, value: &Value) {
+    let (prompt, completion) = usage_from_body(value);
+    if prompt.is_some() {
+        usage.prompt_tokens = prompt;
+    }
+    if completion.is_some() {
+        usage.completion_tokens = completion;
+    }
+}
+
+fn track_stream_usage<S>(
+    byte_stream: S,
+    usage_tx: oneshot::Sender<StreamUsage>,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>>
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    async_stream::stream! {
+        let mut rest = Vec::new();
+        let mut usage = StreamUsage::default();
+        futures_util::pin_mut!(byte_stream);
+        while let Some(chunk) = byte_stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    capture_usage_from_sse_bytes(&mut rest, &bytes, &mut usage);
+                    yield Ok(bytes);
+                }
+                Err(err) => {
+                    let _ = usage_tx.send(usage);
+                    yield Err(err);
+                    return;
+                }
+            }
+        }
+        for line in flush_sse_bytes(&mut rest) {
+            capture_usage_from_sse_line(&line, &mut usage);
+        }
+        let _ = usage_tx.send(usage);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +666,10 @@ mod tests {
         }
     }
 
+    fn policy() -> UpstreamUrlPolicy {
+        UpstreamUrlPolicy::allow_loopback_for_tests()
+    }
+
     #[tokio::test]
     async fn openai_to_openai_rewrites_model() {
         let mock = MockServer::start().await;
@@ -537,9 +684,8 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let client = http_client().expect("client");
-        let (res, meta) = proxy(
-            &client,
+        let (res, meta, _) = proxy(
+            &policy(),
             Protocol::OpenAi,
             &provider("openai", &mock.uri()),
             "llama3.2",
@@ -566,9 +712,8 @@ mod tests {
             })))
             .mount(&mock)
             .await;
-        let client = http_client().expect("client");
-        let (res, _) = proxy(
-            &client,
+        let (res, _, _) = proxy(
+            &policy(),
             Protocol::DeepSeek,
             &provider("openai", &mock.uri()),
             "deepseek-chat",
@@ -593,9 +738,8 @@ mod tests {
             })))
             .mount(&mock)
             .await;
-        let client = http_client().expect("client");
-        let (res, _) = proxy(
-            &client,
+        let (res, _, _) = proxy(
+            &policy(),
             Protocol::Glm,
             &provider("glm", &mock.uri()),
             "glm-4",
@@ -627,9 +771,8 @@ mod tests {
             })))
             .mount(&mock)
             .await;
-        let client = http_client().expect("client");
-        let (res, meta) = proxy(
-            &client,
+        let (res, meta, _) = proxy(
+            &policy(),
             Protocol::OpenAi,
             &provider("anthropic", &mock.uri()),
             "claude-3",
@@ -680,6 +823,165 @@ mod tests {
         assert!(messages[0].contains("data: {\"type\":\"message_stop\"}"));
         assert!(messages[0].ends_with("\n\n"));
         assert_eq!(messages[0].matches("\n\n").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn openai_stream_captures_usage_from_sse() {
+        let mock = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&mock)
+            .await;
+        let (res, _, usage_rx) = proxy(
+            &policy(),
+            Protocol::OpenAi,
+            &provider("openai", &mock.uri()),
+            "model",
+            json!({"model": "m", "messages": [{"role":"user","content":"hi"}], "stream": true}),
+        )
+        .await
+        .expect("proxy");
+        assert!(res.status().is_success());
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(!body.is_empty());
+        let usage = usage_rx.expect("usage channel").await.expect("usage");
+        assert_eq!(usage.prompt_tokens, Some(9));
+        assert_eq!(usage.completion_tokens, Some(4));
+    }
+
+    #[tokio::test]
+    async fn redirect_to_loopback_is_not_followed() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "http://127.0.0.1:1/evil"),
+            )
+            .mount(&mock)
+            .await;
+
+        let (res, _, _) = proxy(
+            &policy(),
+            Protocol::OpenAi,
+            &provider("openai", &mock.uri()),
+            "model",
+            json!({"model": "m", "messages": [{"role":"user","content":"hi"}]}),
+        )
+        .await
+        .expect("proxy");
+        assert_eq!(res.status(), StatusCode::FOUND);
+        assert!(
+            res.headers().get(header::LOCATION).is_none(),
+            "internal redirect Location must not be forwarded to clients"
+        );
+    }
+
+    #[test]
+    fn strips_internal_location_from_upstream_redirect_headers() {
+        let mut upstream = reqwest::header::HeaderMap::new();
+        upstream.insert(
+            reqwest::header::LOCATION,
+            reqwest::header::HeaderValue::from_static("http://127.0.0.1/evil"),
+        );
+        upstream.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        let filtered = filter_upstream_response_headers(StatusCode::FOUND, &upstream);
+        assert!(filtered.get(header::LOCATION).is_none());
+        assert_eq!(
+            filtered.get(header::CONTENT_TYPE).map(|v| v.to_str().ok()),
+            Some(Some("application/json"))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_proxy_uses_pinned_http() {
+        let before = pinned_http::pinned_send_count();
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .mount(&mock)
+            .await;
+
+        proxy(
+            &policy(),
+            Protocol::OpenAi,
+            &provider("openai", &mock.uri()),
+            "model",
+            json!({"model": "m", "messages": [{"role":"user","content":"hi"}]}),
+        )
+        .await
+        .expect("proxy");
+
+        assert!(
+            pinned_http::pinned_send_count() > before,
+            "provider proxy must use pinned_http::send_pinned"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_translated_stream_emits_text_once() {
+        use http_body_util::BodyExt;
+
+        let mock = MockServer::start().await;
+        let sse = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"pong\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&mock)
+            .await;
+
+        let (res, _, _) = proxy(
+            &policy(),
+            Protocol::OpenAi,
+            &provider("anthropic", &mock.uri()),
+            "claude",
+            json!({
+                "model": "friendly",
+                "messages": [{"role":"user","content":"ping"}],
+                "stream": true
+            }),
+        )
+        .await
+        .expect("proxy");
+        assert!(res.status().is_success());
+        let body = res.into_body().collect().await.expect("body").to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(text.matches("pong").count(), 1, "stream body: {text}");
+        assert_eq!(
+            text.matches("\"finish_reason\":\"stop\"").count(),
+            1,
+            "stream body: {text}"
+        );
     }
 
     #[test]

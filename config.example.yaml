@@ -5,6 +5,11 @@ host: "0.0.0.0"
 port: 8080
 # database_url: "postgres://closedrouter:closedrouter@localhost:5432/closedrouter"
 # admin_token: "replace-me"
+# metrics_token: "replace-me-for-prometheus-scrapes"
+# Narrow opt-in for local upstreams (Ollama, etc.). Leave unset in production.
+# allow_private_upstream_hosts:
+#   - "127.0.0.1"
+#   - "localhost"
 # embedding_model: "text-embedding-3-small"
 # request_log_limit: 10000
 cors_origins:
@@ -17,12 +22,6 @@ langfuse:
   # secret_key: "sk-lf-..."
 
 # Seeded only when the catalog is empty (first boot).
-providers:
-  - name: Ollama
-    kind: openai
-    base_url: "http://127.0.0.1:11434/v1"
-    models:
-      - id: llama3
-        upstream_model: llama3.2
-        display_name: Llama 3
-        capability: chat
+# Public HTTPS upstreams work out of the box. Local Ollama requires
+# allow_private_upstream_hosts (above) before using http://127.0.0.1:11434/v1.
+providers: []
