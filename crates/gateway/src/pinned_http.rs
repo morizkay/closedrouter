@@ -79,16 +79,107 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::str::FromStr;
+    use crate::url_policy::UpstreamUrlPolicy;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Simulates connect-time DNS rebind to a different address than `resolve_pin` selected.
+    #[derive(Clone)]
+    struct RebindEvilResolver {
+        evil: SocketAddr,
+    }
+
+    impl Resolve for RebindEvilResolver {
+        fn resolve(&self, _name: Name) -> Resolving {
+            let evil = self.evil;
+            Box::pin(async move {
+                let addrs: Addrs = Box::new(std::iter::once(evil));
+                Ok(addrs)
+            })
+        }
+    }
+
+    async fn send_with_connect_resolver<F, R>(
+        url: &str,
+        policy: &UpstreamUrlPolicy,
+        resolver: Arc<R>,
+        build: F,
+    ) -> AppResult<Response>
+    where
+        R: Resolve + Send + Sync + 'static,
+        F: FnOnce(Client, &str) -> RequestBuilder,
+    {
+        let pin = url_policy::resolve_pin(url, policy).await?;
+        let client = base_builder()
+            .dns_resolver(resolver)
+            .build()
+            .map_err(|err| AppError::Internal(format!("build HTTP client: {err}")))?;
+        Ok(build(client, pin.url.as_str()).send().await?)
+    }
 
     #[tokio::test]
-    async fn pin_resolver_returns_only_pinned_address() {
-        let pinned = SocketAddr::from((IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443));
-        let resolver = PinResolver { addr: pinned };
-        let name = Name::from_str("rebind.example").expect("dns name");
-        let mut addrs = resolver.resolve(name).await.expect("resolve");
-        assert_eq!(addrs.next(), Some(pinned));
-        assert_eq!(addrs.next(), None);
+    async fn send_pinned_connects_to_pinned_ip_when_dns_rebinds() {
+        const PINNED_BODY: &str = "PINNED_OK";
+        const EVIL_BODY: &str = "EVIL_REBIND";
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pin-check"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(PINNED_BODY))
+            .mount(&mock)
+            .await;
+        let pinned_addr: SocketAddr = *mock.address();
+        let pin_target = pinned_addr;
+        let pinned_port = pinned_addr.port();
+
+        let evil_listener =
+            std::net::TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), pinned_port))
+                .expect("bind evil rebind listener on 127.0.0.2 with pinned port");
+        let evil_addr = evil_listener.local_addr().expect("evil addr");
+        let evil_mock = MockServer::builder()
+            .listener(evil_listener)
+            .start()
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pin-check"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(EVIL_BODY))
+            .mount(&evil_mock)
+            .await;
+
+        let hook = Arc::new(move |host: &str, _port: u16| {
+            assert_eq!(host, "rebind-pin.example");
+            Ok(vec![pin_target])
+        });
+        let _guard = url_policy::test_dns_scope(hook);
+        let policy = UpstreamUrlPolicy::from_allowlist(&["rebind-pin.example".into()]);
+        let url = format!(
+            "http://rebind-pin.example:{}/pin-check",
+            pinned_addr.port()
+        );
+
+        let pinned_response = send_pinned(&url, &policy, |client, url| client.get(url))
+            .await
+            .expect("pinned HTTP connect must reach wiremock on the pinned address");
+        assert_eq!(
+            pinned_response.text().await.expect("pinned body"),
+            PINNED_BODY,
+            "provider path must connect to the address from resolve_pin, not a later DNS result"
+        );
+
+        let evil_response = send_with_connect_resolver(
+            &url,
+            &policy,
+            Arc::new(RebindEvilResolver { evil: evil_addr }),
+            |client, url| client.get(url),
+        )
+        .await
+        .expect("rebind resolver connect");
+        assert_eq!(
+            evil_response.text().await.expect("evil body"),
+            EVIL_BODY,
+            "control: connect-time DNS rebind reaches the evil listener when PinResolver is not used"
+        );
     }
 }

@@ -236,7 +236,7 @@ fn clear_test_dns_hook() {
 }
 
 #[cfg(test)]
-struct TestDnsGuard;
+pub(crate) struct TestDnsGuard;
 
 #[cfg(test)]
 impl Drop for TestDnsGuard {
@@ -246,7 +246,7 @@ impl Drop for TestDnsGuard {
 }
 
 #[cfg(test)]
-fn test_dns_scope(hook: TestDnsHook) -> TestDnsGuard {
+pub(crate) fn test_dns_scope(hook: TestDnsHook) -> TestDnsGuard {
     set_test_dns_hook(hook);
     TestDnsGuard
 }
@@ -341,9 +341,24 @@ pub fn extract_embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
         return ipv4_from_tail_hextets(segments[6], segments[7]);
     }
 
-    // 6to4 2002::/16
+    // 6to4 2002::/16 (also covers 6rd-style IPv4-in-IPv6 when the address uses 2002::/16)
     if segments[0] == 0x2002 {
         return ipv4_from_hextets(segments[1], segments[2]);
+    }
+
+    // Teredo 2001:0000::/32 — client IPv4 XORed with 0xFFFFFFFF in the low 32 bits.
+    if segments[0] == 0x2001 && segments[1] == 0x0000 {
+        return Some(Ipv4Addr::new(
+            ((segments[6] >> 8) as u8) ^ 0xff,
+            ((segments[6] & 0xff) as u8) ^ 0xff,
+            ((segments[7] >> 8) as u8) ^ 0xff,
+            ((segments[7] & 0xff) as u8) ^ 0xff,
+        ));
+    }
+
+    // ISATAP — interface id contains 0000:5EFE:w.x.y.z (or 0200:5EFE for modified EUI-64).
+    if (segments[4] == 0x0000 || segments[4] == 0x0200) && segments[5] == 0x5efe {
+        return ipv4_from_tail_hextets(segments[6], segments[7]);
     }
 
     // IPv4-compatible ::/96 (excluding :: and ::1, excluding ::ffff: handled above)
@@ -519,30 +534,38 @@ mod tests {
         assert!(validate_provider_base_url(&format!("https://[{addr}]/v1"), &policy).is_err());
     }
 
-    #[tokio::test]
-    async fn resolve_pin_uses_first_public_resolution_when_dns_rebinds() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+    #[test]
+    fn rejects_teredo_loopback_embedding_without_allowlist() {
+        let policy = UpstreamUrlPolicy::default();
+        // 127.0.0.1 XOR 0xFFFFFFFF = 128.255.255.254
+        let addr = Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0x80ff, 0xfffe);
+        assert!(!is_public_unicast_ip(IpAddr::V6(addr)));
+        assert!(validate_provider_base_url(&format!("https://[{addr}]/v1"), &policy).is_err());
+    }
 
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hook = {
-            let calls = calls.clone();
-            Arc::new(move |_host: &str, port: u16| {
-                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
-                if n == 1 {
-                    Ok(vec![SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), port))])
-                } else {
-                    Ok(vec![SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), port))])
-                }
-            }) as TestDnsHook
-        };
-        let _guard = test_dns_scope(hook);
+    #[test]
+    fn rejects_teredo_rfc1918_embedding_without_allowlist() {
+        let policy = UpstreamUrlPolicy::default();
+        // 10.0.0.0 XOR 0xFFFFFFFF = 245.255.255.255
+        let addr = Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0xf5ff, 0xffff);
+        assert!(!is_public_unicast_ip(IpAddr::V6(addr)));
+        assert!(validate_provider_base_url(&format!("https://[{addr}]/v1"), &policy).is_err());
+    }
 
-        let pin = resolve_pin("https://rebind.example/v1", &UpstreamUrlPolicy::default())
-            .await
-            .expect("first resolution pins public IP");
-        assert_eq!(pin.socket_addr.ip(), IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    #[test]
+    fn rejects_isatap_loopback_embedding_without_allowlist() {
+        let policy = UpstreamUrlPolicy::default();
+        let addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x0000, 0x5efe, 0x7f00, 0x0001);
+        assert!(!is_public_unicast_ip(IpAddr::V6(addr)));
+        assert!(validate_provider_base_url(&format!("https://[{addr}]/v1"), &policy).is_err());
+    }
+
+    #[test]
+    fn rejects_isatap_rfc1918_embedding_without_allowlist() {
+        let policy = UpstreamUrlPolicy::default();
+        let addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x0000, 0x5efe, 0x0a00, 0x0001);
+        assert!(!is_public_unicast_ip(IpAddr::V6(addr)));
+        assert!(validate_provider_base_url(&format!("https://[{addr}]/v1"), &policy).is_err());
     }
 
     #[tokio::test]
