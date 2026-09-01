@@ -165,7 +165,6 @@ async fn proxy_chat(
 
     if state.config.langfuse_enabled() {
         observability::spawn_trace(
-            state.http.clone(),
             state.config.langfuse.clone(),
             observability::TraceEvent {
                 protocol: incoming.as_str(),

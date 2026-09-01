@@ -37,7 +37,6 @@ use tracing_subscriber::EnvFilter;
 pub struct AppState {
     pub db: PgPool,
     pub config: Arc<Config>,
-    pub http: reqwest::Client,
     pub admin_token: String,
     pub metrics_token: Option<String>,
     pub upstream_url_policy: UpstreamUrlPolicy,
@@ -73,7 +72,6 @@ pub async fn run() -> anyhow::Result<()> {
     let bind = config.bind_addr()?;
     let state = AppState {
         db,
-        http: upstream::http_client()?,
         admin_token: admin_token.clone(),
         metrics_token: config.metrics_token.clone(),
         upstream_url_policy: config.upstream_url_policy(),
@@ -338,7 +336,6 @@ mod tests {
         let metrics = observability::install_metrics().ok()?;
         Some(AppState {
             db,
-            http: upstream::http_client().ok()?,
             admin_token: "test-admin".into(),
             metrics_token: Some("test-metrics".into()),
             upstream_url_policy: crate::url_policy::UpstreamUrlPolicy::allow_loopback_for_tests(),

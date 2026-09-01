@@ -12,7 +12,7 @@ use crate::translate::{
 };
 use crate::url_policy::UpstreamUrlPolicy;
 use axum::body::Body;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -129,10 +129,11 @@ pub async fn proxy(
         apply_upstream_auth(client.post(url).json(&payload), provider)
     })
     .await?;
+    let upstream_headers = response.headers().clone();
     let status_code = response.status().as_u16();
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
 
-    if stream {
+    if stream && status.is_success() {
         let (res, usage_rx) =
             pipe_stream(incoming, upstream_kind, upstream_model, response, status).await?;
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -179,7 +180,7 @@ pub async fn proxy(
         );
         let message = String::from_utf8_lossy(&bytes).chars().take(500).collect();
         return Ok((
-            json_passthrough(status, bytes),
+            build_upstream_json_response(status, bytes, &upstream_headers),
             ProxyMeta {
                 status: status_code,
                 latency_ms,
@@ -221,7 +222,7 @@ pub async fn proxy(
     );
 
     Ok((
-        json_passthrough(status, out_bytes),
+        build_upstream_json_response(status, out_bytes, &upstream_headers),
         ProxyMeta {
             status: status_code,
             latency_ms,
@@ -253,10 +254,11 @@ pub async fn embeddings(
         apply_upstream_auth(client.post(url).json(&body), provider)
     })
     .await?;
+    let upstream_headers = response.headers().clone();
     let status_code = response.status().as_u16();
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
     let bytes = response.bytes().await?;
-    Ok(json_passthrough(status, bytes))
+    Ok(build_upstream_json_response(status, bytes, &upstream_headers))
 }
 
 /// Fetch a single embedding vector (1536-d expected by Hermes).
@@ -296,13 +298,64 @@ pub async fn embed_text(
     Ok(out)
 }
 
-fn json_passthrough(status: StatusCode, bytes: Bytes) -> Response {
+fn upstream_header_leaks_internal_destination(name: &str) -> bool {
+    matches!(
+        name,
+        "location" | "refresh" | "content-location" | "link"
+    )
+}
+
+/// Copy upstream response headers safe to expose to API clients.
+pub(crate) fn filter_upstream_response_headers(
+    status: StatusCode,
+    upstream: &reqwest::header::HeaderMap,
+) -> HeaderMap {
+    if status.is_success() {
+        return HeaderMap::new();
+    }
+
+    let mut headers = HeaderMap::new();
+    for (name, value) in upstream {
+        let lower = name.as_str().to_ascii_lowercase();
+        if upstream_header_leaks_internal_destination(&lower) {
+            continue;
+        }
+        if matches!(
+            lower.as_str(),
+            "content-type" | "content-length" | "retry-after"
+        ) {
+            if let (Ok(header_name), Ok(header_value)) = (
+                HeaderName::from_bytes(name.as_str().as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                headers.insert(header_name, header_value);
+            }
+        }
+    }
+    headers
+}
+
+fn build_upstream_json_response(
+    status: StatusCode,
+    bytes: Bytes,
+    upstream_headers: &reqwest::header::HeaderMap,
+) -> Response {
+    let mut headers = filter_upstream_response_headers(status, upstream_headers);
+    if !headers.contains_key(header::CONTENT_TYPE) {
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+
     match Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(bytes))
     {
-        Ok(res) => res,
+        Ok(mut res) => {
+            *res.headers_mut() = headers;
+            res
+        }
         Err(err) => {
             tracing::error!(error = %err, "failed to build JSON response");
             let mut res = Response::new(Body::from(
@@ -830,6 +883,58 @@ mod tests {
         .await
         .expect("proxy");
         assert_eq!(res.status(), StatusCode::FOUND);
+        assert!(
+            res.headers().get(header::LOCATION).is_none(),
+            "internal redirect Location must not be forwarded to clients"
+        );
+    }
+
+    #[test]
+    fn strips_internal_location_from_upstream_redirect_headers() {
+        let mut upstream = reqwest::header::HeaderMap::new();
+        upstream.insert(
+            reqwest::header::LOCATION,
+            reqwest::header::HeaderValue::from_static("http://127.0.0.1/evil"),
+        );
+        upstream.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        let filtered = filter_upstream_response_headers(StatusCode::FOUND, &upstream);
+        assert!(filtered.get(header::LOCATION).is_none());
+        assert_eq!(
+            filtered.get(header::CONTENT_TYPE).map(|v| v.to_str().ok()),
+            Some(Some("application/json"))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_proxy_uses_pinned_http() {
+        let before = pinned_http::pinned_send_count();
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .mount(&mock)
+            .await;
+
+        proxy(
+            &policy(),
+            Protocol::OpenAi,
+            &provider("openai", &mock.uri()),
+            "model",
+            json!({"model": "m", "messages": [{"role":"user","content":"hi"}]}),
+        )
+        .await
+        .expect("proxy");
+
+        assert!(
+            pinned_http::pinned_send_count() > before,
+            "provider proxy must use pinned_http::send_pinned"
+        );
     }
 
     #[tokio::test]

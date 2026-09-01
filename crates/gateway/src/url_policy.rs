@@ -206,12 +206,61 @@ fn pick_public_pin(host: &str, addrs: &[SocketAddr]) -> AppResult<SocketAddr> {
 }
 
 async fn resolve_host(host: &str, port: u16) -> AppResult<Vec<SocketAddr>> {
+    #[cfg(test)]
+    if let Some(addrs) = test_dns_resolve(host, port).await? {
+        return Ok(addrs);
+    }
+
     tokio::net::lookup_host((host, port))
         .await
         .map_err(|err| {
             AppError::BadRequest(format!("upstream host '{host}' could not be resolved: {err}"))
         })
         .map(|iter| iter.collect())
+}
+
+#[cfg(test)]
+type TestDnsHook = std::sync::Arc<dyn Fn(&str, u16) -> AppResult<Vec<SocketAddr>> + Send + Sync>;
+
+#[cfg(test)]
+static TEST_DNS: std::sync::Mutex<Option<TestDnsHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_test_dns_hook(hook: TestDnsHook) {
+    *TEST_DNS.lock().expect("test dns lock") = Some(hook);
+}
+
+#[cfg(test)]
+fn clear_test_dns_hook() {
+    *TEST_DNS.lock().expect("test dns lock") = None;
+}
+
+#[cfg(test)]
+struct TestDnsGuard;
+
+#[cfg(test)]
+impl Drop for TestDnsGuard {
+    fn drop(&mut self) {
+        clear_test_dns_hook();
+    }
+}
+
+#[cfg(test)]
+fn test_dns_scope(hook: TestDnsHook) -> TestDnsGuard {
+    set_test_dns_hook(hook);
+    TestDnsGuard
+}
+
+#[cfg(test)]
+async fn test_dns_resolve(host: &str, port: u16) -> AppResult<Option<Vec<SocketAddr>>> {
+    let hook = TEST_DNS
+        .lock()
+        .expect("test dns lock")
+        .clone();
+    if let Some(hook) = hook {
+        return Ok(Some(hook(host, port)?));
+    }
+    Ok(None)
 }
 
 fn parse_http_url(url: &str) -> AppResult<Url> {
@@ -260,15 +309,62 @@ fn parse_ip_literal(host: &str) -> Option<IpAddr> {
     host.parse().ok()
 }
 
-/// Unwrap IPv4-mapped IPv6 (`::ffff:x.x.x.x`) before classification.
+/// Unwrap IPv4-mapped, 6to4, NAT64, and IPv4-compatible IPv6 before classification.
 pub fn canonicalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => extract_embedded_ipv4(v6)
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(v6)),
-        other => other,
     }
+}
+
+/// Extract an embedded IPv4 address from transitional IPv6 forms.
+pub fn extract_embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+
+    let segments = v6.segments();
+
+    // NAT64 well-known prefix 64:ff9b::/96
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6].iter().all(|&s| s == 0) {
+        return ipv4_from_tail_hextets(segments[6], segments[7]);
+    }
+
+    // NAT64 local-use prefix 64:ff9b:1::/48 (IPv4 in low 32 bits)
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0x0001
+        && segments[3..6].iter().all(|&s| s == 0)
+    {
+        return ipv4_from_tail_hextets(segments[6], segments[7]);
+    }
+
+    // 6to4 2002::/16
+    if segments[0] == 0x2002 {
+        return ipv4_from_hextets(segments[1], segments[2]);
+    }
+
+    // IPv4-compatible ::/96 (excluding :: and ::1, excluding ::ffff: handled above)
+    if segments[..6].iter().all(|&s| s == 0) && (segments[6] != 0 || segments[7] != 0) {
+        return ipv4_from_tail_hextets(segments[6], segments[7]);
+    }
+
+    None
+}
+
+fn ipv4_from_hextets(high: u16, low: u16) -> Option<Ipv4Addr> {
+    Some(Ipv4Addr::new(
+        (high >> 8) as u8,
+        (high & 0xff) as u8,
+        (low >> 8) as u8,
+        (low & 0xff) as u8,
+    ))
+}
+
+fn ipv4_from_tail_hextets(high: u16, low: u16) -> Option<Ipv4Addr> {
+    ipv4_from_hextets(high, low)
 }
 
 pub fn is_public_unicast_ip(ip: IpAddr) -> bool {
@@ -389,6 +485,64 @@ mod tests {
         let policy = policy();
         validate_provider_base_url("http://127.0.0.1:11434/v1", &policy).expect("loopback");
         validate_provider_base_url("http://localhost:11434/v1", &policy).expect("localhost");
+    }
+
+    #[test]
+    fn rejects_6to4_loopback_embedding_without_allowlist() {
+        let policy = UpstreamUrlPolicy::default();
+        let addr = Ipv6Addr::new(0x2002, 0x7f00, 0x0001, 0, 0, 0, 0, 0);
+        assert!(!is_public_unicast_ip(IpAddr::V6(addr)));
+        assert!(validate_provider_base_url(&format!("https://[{addr}]/v1"), &policy).is_err());
+    }
+
+    #[test]
+    fn rejects_6to4_rfc1918_embedding_without_allowlist() {
+        let policy = UpstreamUrlPolicy::default();
+        let addr = Ipv6Addr::new(0x2002, 0x0a00, 0, 0, 0, 0, 0, 0);
+        assert!(!is_public_unicast_ip(IpAddr::V6(addr)));
+        assert!(validate_provider_base_url(&format!("https://[{addr}]/v1"), &policy).is_err());
+    }
+
+    #[test]
+    fn rejects_nat64_rfc1918_embedding_without_allowlist() {
+        let policy = UpstreamUrlPolicy::default();
+        let addr = Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 0x0001);
+        assert!(!is_public_unicast_ip(IpAddr::V6(addr)));
+        assert!(validate_provider_base_url(&format!("https://[{addr}]/v1"), &policy).is_err());
+    }
+
+    #[test]
+    fn rejects_ipv4_compatible_loopback_without_allowlist() {
+        let policy = UpstreamUrlPolicy::default();
+        let addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001);
+        assert!(!is_public_unicast_ip(IpAddr::V6(addr)));
+        assert!(validate_provider_base_url(&format!("https://[{addr}]/v1"), &policy).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_pin_uses_first_public_resolution_when_dns_rebinds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let calls = calls.clone();
+            Arc::new(move |_host: &str, port: u16| {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    Ok(vec![SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), port))])
+                } else {
+                    Ok(vec![SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), port))])
+                }
+            }) as TestDnsHook
+        };
+        let _guard = test_dns_scope(hook);
+
+        let pin = resolve_pin("https://rebind.example/v1", &UpstreamUrlPolicy::default())
+            .await
+            .expect("first resolution pins public IP");
+        assert_eq!(pin.socket_addr.ip(), IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

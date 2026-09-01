@@ -6,12 +6,24 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use metrics::{counter, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 use std::time::Duration;
 use uuid::Uuid;
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+static LANGFUSE_HTTP: OnceLock<Client> = OnceLock::new();
+
+fn langfuse_http_client() -> &'static Client {
+    LANGFUSE_HTTP.get_or_init(|| {
+        Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build langfuse HTTP client")
+    })
+}
 
 /// Install the Prometheus recorder once per process.
 pub fn install_metrics() -> anyhow::Result<PrometheusHandle> {
@@ -66,7 +78,7 @@ pub struct TraceEvent<'a> {
 }
 
 /// Fire-and-forget Langfuse ingestion. Never fails the user request.
-pub fn spawn_trace(http: reqwest::Client, cfg: LangfuseConfig, event: TraceEvent<'_>) {
+pub fn spawn_trace(cfg: LangfuseConfig, event: TraceEvent<'_>) {
     if !cfg.enabled {
         return;
     }
@@ -119,7 +131,8 @@ pub fn spawn_trace(http: reqwest::Client, cfg: LangfuseConfig, event: TraceEvent
     });
 
     tokio::spawn(async move {
-        if let Err(err) = post_langfuse(&http, &host, &public, &secret, body).await {
+        let http = langfuse_http_client();
+        if let Err(err) = post_langfuse(http, &host, &public, &secret, body).await {
             tracing::debug!(error = %err, "langfuse export skipped");
         }
     });
