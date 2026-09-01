@@ -1,18 +1,26 @@
 //! SSRF controls for provider `base_url` values and outbound upstream requests.
 //!
-//! Validates URLs on catalog writes and re-checks resolved addresses on every
-//! outbound request to mitigate DNS rebinding.
+//! Default-deny **allowlist** model: only public-unicast HTTPS destinations unless a
+//! hostname is explicitly listed in `allow_private_upstream_hosts`. Outbound requests
+//! resolve DNS once, pin the connect IP, and disable HTTP redirects.
 
 use crate::error::{AppError, AppResult};
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use url::Url;
 
-/// Policy for which upstream hosts are permitted.
+/// Policy for narrowly scoped private/loopback upstream opt-in.
 #[derive(Debug, Clone, Default)]
 pub struct UpstreamUrlPolicy {
-    /// Hostnames or IP literals that may target private/link-local space.
+    /// Hostnames or IP literals permitted to target non-public space (local Ollama, etc.).
     pub allow_private_hosts: HashSet<String>,
+}
+
+/// Resolved upstream target with a pinned connect address.
+#[derive(Debug, Clone)]
+pub struct PinTarget {
+    pub url: Url,
+    pub socket_addr: SocketAddr,
 }
 
 impl UpstreamUrlPolicy {
@@ -37,14 +45,55 @@ impl UpstreamUrlPolicy {
     }
 }
 
-/// Validate a provider `base_url` before persisting it.
+/// Validate a provider `base_url` before persisting it (hostname / literal checks only).
 pub fn validate_provider_base_url(url: &str, policy: &UpstreamUrlPolicy) -> AppResult<()> {
     let parsed = parse_http_url(url)?;
-    let host = parsed
+    validate_url_policy(&parsed, policy)
+}
+
+/// Resolve DNS once, classify addresses, and return a pinned connect target.
+pub async fn resolve_pin(url: &str, policy: &UpstreamUrlPolicy) -> AppResult<PinTarget> {
+    let parsed = parse_http_url(url)?;
+    validate_url_policy(&parsed, policy)?;
+
+    let host = parsed.host_str().expect("host");
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| AppError::BadRequest("upstream URL is missing a port".into()))?;
+
+    if let Some(ip) = parse_ip_literal(host) {
+        ensure_allowed_ip(ip, host, policy)?;
+        return Ok(PinTarget {
+            url: parsed,
+            socket_addr: SocketAddr::new(ip, port),
+        });
+    }
+
+    if policy.is_private_host_allowed(host) {
+        let addrs = resolve_host(host, port).await?;
+        let socket_addr = addrs.into_iter().next().ok_or_else(|| {
+            AppError::BadRequest(format!("upstream host '{host}' did not resolve to any address"))
+        })?;
+        return Ok(PinTarget {
+            url: parsed,
+            socket_addr,
+        });
+    }
+
+    let addrs = resolve_host(host, port).await?;
+    let socket_addr = pick_public_pin(host, &addrs)?;
+    Ok(PinTarget {
+        url: parsed,
+        socket_addr,
+    })
+}
+
+fn validate_url_policy(url: &Url, policy: &UpstreamUrlPolicy) -> AppResult<()> {
+    let host = url
         .host_str()
         .ok_or_else(|| AppError::BadRequest("provider base_url must include a host".into()))?;
 
-    if host_has_credentials(&parsed) {
+    if host_has_credentials(url) {
         return Err(AppError::BadRequest(
             "provider base_url must not include username or password".into(),
         ));
@@ -54,69 +103,115 @@ pub fn validate_provider_base_url(url: &str, policy: &UpstreamUrlPolicy) -> AppR
         return Ok(());
     }
 
-    if is_blocked_hostname(host) {
+    if let Some(ip) = parse_ip_literal(host) {
+        ensure_allowed_ip(ip, host, policy)?;
+        require_https(url)?;
+        return Ok(());
+    }
+
+    require_https(url)?;
+    ensure_public_hostname(host)?;
+    Ok(())
+}
+
+fn require_https(url: &Url) -> AppResult<()> {
+    if url.scheme() == "https" {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "provider base_url must use https for public upstream hosts (http is only allowed for explicitly allowlisted private hosts)".into(),
+        ))
+    }
+}
+
+fn ensure_public_hostname(host: &str) -> AppResult<()> {
+    let host = normalize_host(host);
+    if host.is_empty() {
+        return Err(AppError::BadRequest(
+            "provider base_url host is not allowed".into(),
+        ));
+    }
+
+    if matches!(
+        host.as_str(),
+        "localhost"
+            | "metadata"
+            | "metadata.google.internal"
+            | "kubernetes"
+            | "kubernetes.default"
+            | "kubernetes.default.svc"
+            | "kubernetes.default.svc.cluster.local"
+    ) {
         return Err(AppError::BadRequest(format!(
             "provider base_url host '{host}' is not allowed"
         )));
     }
 
-    if let Some(ip) = parse_ip_literal(host) {
-        if is_non_public_ip(ip) {
-            return Err(AppError::BadRequest(format!(
-                "provider base_url must not target private or link-local address {ip}"
-            )));
-        }
-        return Ok(());
+    if host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.ends_with(".svc")
+        || host.ends_with(".svc.cluster.local")
+        || host.ends_with(".cluster.local")
+    {
+        return Err(AppError::BadRequest(format!(
+            "provider base_url host '{host}' is not allowed"
+        )));
+    }
+
+    if !host.contains('.') {
+        return Err(AppError::BadRequest(format!(
+            "provider base_url host '{host}' must be a fully qualified public hostname"
+        )));
     }
 
     Ok(())
 }
 
-/// Re-validate an outbound URL immediately before connecting (DNS rebinding defense).
-pub async fn validate_outbound_url(url: &str, policy: &UpstreamUrlPolicy) -> AppResult<()> {
-    validate_provider_base_url(url, policy)?;
-
-    let parsed = parse_http_url(url)?;
-    let host = parsed.host_str().expect("validated above");
-
-    if policy.is_private_host_allowed(host) {
-        return Ok(());
+fn ensure_allowed_ip(ip: IpAddr, host: &str, policy: &UpstreamUrlPolicy) -> AppResult<()> {
+    let ip = canonicalize_ip(ip);
+    if policy.is_private_host_allowed(host) || is_public_unicast_ip(ip) {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "provider base_url must not target non-public address {ip}"
+        )))
     }
+}
 
-    if let Some(ip) = parse_ip_literal(host) {
-        if is_non_public_ip(ip) {
-            return Err(AppError::BadRequest(format!(
-                "upstream host resolves to non-public address {ip}"
-            )));
-        }
-        return Ok(());
-    }
-
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|err| {
-            AppError::BadRequest(format!("upstream host '{host}' could not be resolved: {err}"))
-        })?;
-
-    let mut any = false;
-    for addr in addrs {
-        any = true;
-        if is_non_public_ip(addr.ip()) {
-            return Err(AppError::BadRequest(format!(
-                "upstream host '{host}' resolves to non-public address {}",
-                addr.ip()
-            )));
-        }
-    }
-
-    if !any {
+fn pick_public_pin(host: &str, addrs: &[SocketAddr]) -> AppResult<SocketAddr> {
+    if addrs.is_empty() {
         return Err(AppError::BadRequest(format!(
             "upstream host '{host}' did not resolve to any address"
         )));
     }
 
-    Ok(())
+    let mut non_public = Vec::new();
+    for addr in addrs {
+        let ip = canonicalize_ip(addr.ip());
+        if is_public_unicast_ip(ip) {
+            return Ok(SocketAddr::new(ip, addr.port()));
+        }
+        non_public.push(ip);
+    }
+
+    Err(AppError::BadRequest(format!(
+        "upstream host '{host}' resolved only to non-public address(es): {}",
+        non_public
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+async fn resolve_host(host: &str, port: u16) -> AppResult<Vec<SocketAddr>> {
+    tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|err| {
+            AppError::BadRequest(format!("upstream host '{host}' could not be resolved: {err}"))
+        })
+        .map(|iter| iter.collect())
 }
 
 fn parse_http_url(url: &str) -> AppResult<Url> {
@@ -162,71 +257,46 @@ fn normalize_host(host: &str) -> String {
 
 fn parse_ip_literal(host: &str) -> Option<IpAddr> {
     let host = normalize_host(host);
-    if host.parse::<Ipv4Addr>().is_ok() || host.parse::<Ipv6Addr>().is_ok() {
-        host.parse().ok()
-    } else {
-        None
-    }
+    host.parse().ok()
 }
 
-fn is_blocked_hostname(host: &str) -> bool {
-    let host = normalize_host(host);
-    if host.is_empty() {
-        return true;
-    }
-
-    if matches!(
-        host.as_str(),
-        "localhost"
-            | "metadata"
-            | "metadata.google.internal"
-            | "kubernetes"
-            | "kubernetes.default"
-            | "kubernetes.default.svc"
-            | "kubernetes.default.svc.cluster.local"
-    ) {
-        return true;
-    }
-
-    if host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".svc")
-        || host.ends_with(".svc.cluster.local")
-        || host.ends_with(".cluster.local")
-    {
-        return true;
-    }
-
-    // Docker Compose / k8s short names (postgres, redis, gateway, …).
-    !host.contains('.')
-}
-
-fn is_non_public_ip(ip: IpAddr) -> bool {
+/// Unwrap IPv4-mapped IPv6 (`::ffff:x.x.x.x`) before classification.
+pub fn canonicalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V4(v4) => is_non_public_ipv4(v4),
-        IpAddr::V6(v6) => is_non_public_ipv6(v6),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
     }
 }
 
-fn is_non_public_ipv4(ip: Ipv4Addr) -> bool {
-    ip.is_loopback()
+pub fn is_public_unicast_ip(ip: IpAddr) -> bool {
+    let ip = canonicalize_ip(ip);
+    match ip {
+        IpAddr::V4(v4) => is_public_unicast_ipv4(v4),
+        IpAddr::V6(v6) => is_public_unicast_ipv6(v6),
+    }
+}
+
+fn is_public_unicast_ipv4(ip: Ipv4Addr) -> bool {
+    !(ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
         || ip.is_unspecified()
         || ip.is_broadcast()
         || ip.octets()[0] == 0
         || metadata_ipv4(ip)
-        || cgnat_ipv4(ip)
+        || cgnat_ipv4(ip))
 }
 
-fn is_non_public_ipv6(ip: Ipv6Addr) -> bool {
-    ip.is_loopback()
+fn is_public_unicast_ipv6(ip: Ipv6Addr) -> bool {
+    !(ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_unique_local()
         || ip.is_unicast_link_local()
         || ip.is_multicast()
-        || documentation_ipv6(ip)
+        || documentation_ipv6(ip))
 }
 
 fn documentation_ipv6(ip: Ipv6Addr) -> bool {
@@ -246,45 +316,72 @@ fn cgnat_ipv4(ip: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn policy() -> UpstreamUrlPolicy {
         UpstreamUrlPolicy::allow_loopback_for_tests()
     }
 
     #[test]
+    fn example_config_does_not_allow_private_hosts_by_default() {
+        let yaml = include_str!("../../../config.example.yaml");
+        let config: crate::config::Config = serde_yaml::from_str(yaml).expect("example yaml");
+        assert!(
+            config.allow_private_upstream_hosts.is_empty(),
+            "config.example.yaml must not enable private upstream hosts by default"
+        );
+    }
+
+    #[test]
+    fn rejects_http_for_public_hostnames() {
+        let policy = UpstreamUrlPolicy::default();
+        assert!(validate_provider_base_url("http://api.openai.com/v1", &policy).is_err());
+        validate_provider_base_url("https://api.openai.com/v1", &policy).expect("https public");
+    }
+
+    #[test]
     fn rejects_metadata_ip_without_allowlist() {
         let policy = UpstreamUrlPolicy::default();
-        let err = validate_provider_base_url("http://169.254.169.254/latest/meta-data", &policy)
+        let err = validate_provider_base_url("https://169.254.169.254/latest/meta-data", &policy)
             .expect_err("metadata IP");
         assert!(err.to_string().contains("169.254"));
     }
 
     #[test]
+    fn rejects_ipv4_mapped_loopback_without_allowlist() {
+        let policy = UpstreamUrlPolicy::default();
+        let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001));
+        assert!(!is_public_unicast_ip(mapped));
+        let err = validate_provider_base_url("https://[::ffff:127.0.0.1]/v1", &policy)
+            .expect_err("mapped loopback");
+        assert!(err.to_string().contains("127.0.0.1") || err.to_string().contains("non-public"));
+    }
+
+    #[test]
+    fn canonicalize_unwraps_ipv4_mapped() {
+        let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001));
+        assert_eq!(canonicalize_ip(mapped), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    }
+
+    #[test]
     fn rejects_rfc1918_without_allowlist() {
         let policy = UpstreamUrlPolicy::default();
-        assert!(validate_provider_base_url("http://10.0.0.1/v1", &policy).is_err());
-        assert!(validate_provider_base_url("http://192.168.1.1/v1", &policy).is_err());
-        assert!(validate_provider_base_url("http://172.16.0.1/v1", &policy).is_err());
+        assert!(validate_provider_base_url("https://10.0.0.1/v1", &policy).is_err());
+        assert!(validate_provider_base_url("https://192.168.1.1/v1", &policy).is_err());
+        assert!(validate_provider_base_url("https://172.16.0.1/v1", &policy).is_err());
     }
 
     #[test]
     fn rejects_internal_docker_hostname() {
         let policy = UpstreamUrlPolicy::default();
-        assert!(validate_provider_base_url("http://postgres:5432", &policy).is_err());
-        assert!(validate_provider_base_url("http://gateway:8080/v1", &policy).is_err());
+        assert!(validate_provider_base_url("https://postgres:5432", &policy).is_err());
+        assert!(validate_provider_base_url("https://gateway:8080/v1", &policy).is_err());
     }
 
     #[test]
     fn rejects_non_http_scheme() {
         let policy = UpstreamUrlPolicy::default();
         assert!(validate_provider_base_url("ftp://example.com/v1", &policy).is_err());
-    }
-
-    #[test]
-    fn allows_public_https() {
-        let policy = UpstreamUrlPolicy::default();
-        validate_provider_base_url("https://api.openai.com/v1", &policy).expect("public https");
-        validate_provider_base_url("https://api.anthropic.com", &policy).expect("anthropic");
     }
 
     #[test]
@@ -295,18 +392,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebinding_blocks_private_resolution_without_allowlist() {
+    async fn resolve_pin_blocks_loopback_without_allowlist() {
         let policy = UpstreamUrlPolicy::default();
-        let err = validate_outbound_url("http://127.0.0.1:9/chat/completions", &policy)
+        let err = resolve_pin("https://127.0.0.1:9/chat/completions", &policy)
             .await
             .expect_err("loopback blocked");
-        assert!(err.to_string().contains("private") || err.to_string().contains("link-local"));
+        assert!(err.to_string().contains("non-public"));
     }
 
     #[tokio::test]
-    async fn rebinding_allows_allowlisted_loopback() {
+    async fn resolve_pin_allows_allowlisted_loopback() {
         let policy = policy();
-        validate_outbound_url("http://127.0.0.1:9/chat/completions", &policy)
+        resolve_pin("http://127.0.0.1:9/chat/completions", &policy)
             .await
             .expect("allowlisted loopback");
     }

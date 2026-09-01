@@ -99,7 +99,6 @@ async fn proxy_chat(
         "chat request"
     );
     let (response, meta, stream_usage) = upstream::proxy(
-        &state.http,
         &state.upstream_url_policy,
         incoming,
         &route.provider,
@@ -227,7 +226,6 @@ pub async fn embeddings(
     let route = db::resolve_model(&state.db, &model).await?;
     tracing::info!(key = %auth.key_name, model = %model, "embeddings");
     upstream::embeddings(
-        &state.http,
         &state.upstream_url_policy,
         &route.provider,
         &route.upstream_model,

@@ -9,6 +9,7 @@ pub mod db;
 pub mod error;
 pub mod hermes;
 pub mod observability;
+pub mod pinned_http;
 pub mod routes;
 pub mod translate;
 pub mod upstream;
@@ -426,7 +427,7 @@ mod tests {
         let body = serde_json::json!({
             "name": "evil",
             "kind": "openai",
-            "base_url": "http://169.254.169.254/latest/meta-data"
+            "base_url": "https://169.254.169.254/latest/meta-data"
         });
         let response = app
             .oneshot(
@@ -613,8 +614,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.expect("body").to_bytes();
         let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("pong"));
-        assert!(text.contains("\"finish_reason\":\"stop\""));
+        assert_eq!(text.matches("pong").count(), 1, "stream body: {text}");
+        assert_eq!(
+            text.matches("\"finish_reason\":\"stop\"").count(),
+            1,
+            "stream body: {text}"
+        );
     }
 }
 
