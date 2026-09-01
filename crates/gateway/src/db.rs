@@ -2,6 +2,7 @@
 
 use crate::config::SeedProvider;
 use crate::error::{AppError, AppResult};
+use crate::url_policy::{self, UpstreamUrlPolicy};
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
 use serde::{Deserialize, Serialize};
@@ -286,6 +287,7 @@ pub async fn find_valid_key(pool: &PgPool, bearer: &str) -> AppResult<Option<Api
 
 pub async fn create_provider(
     pool: &PgPool,
+    policy: &UpstreamUrlPolicy,
     name: &str,
     kind: &str,
     base_url: &str,
@@ -294,6 +296,8 @@ pub async fn create_provider(
     let kind = normalize_kind(kind)?;
     let name = require_nonempty(name, "name")?;
     let base_url = require_nonempty(base_url, "base_url")?;
+    url_policy::validate_provider_base_url(&base_url, policy)?;
+    // TODO(P0): encrypt provider api_key at rest instead of storing plaintext in Postgres.
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO providers (id, name, kind, base_url, api_key) VALUES ($1, $2, $3, $4, $5)",
@@ -310,8 +314,10 @@ pub async fn create_provider(
         .ok_or_else(|| AppError::Internal("provider insert failed".into()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_provider(
     pool: &PgPool,
+    policy: &UpstreamUrlPolicy,
     id: &str,
     name: Option<&str>,
     kind: Option<&str>,
@@ -335,6 +341,7 @@ pub async fn update_provider(
         .map(|v| require_nonempty(v, "base_url"))
         .transpose()?
         .unwrap_or(existing.base_url);
+    url_policy::validate_provider_base_url(&base_url, policy)?;
     let next_key = if clear_api_key {
         None
     } else if let Some(key) = api_key {
@@ -616,7 +623,11 @@ pub async fn model_count(pool: &PgPool) -> AppResult<i64> {
 /// Completeness is "every config model id exists". A failed first boot that
 /// inserted some rows no longer permanently skips the rest: the next boot
 /// continues from the remaining items. New inserts in this call are atomic.
-pub async fn seed_catalog(pool: &PgPool, providers: &[SeedProvider]) -> AppResult<usize> {
+pub async fn seed_catalog(
+    pool: &PgPool,
+    policy: &UpstreamUrlPolicy,
+    providers: &[SeedProvider],
+) -> AppResult<usize> {
     if providers.is_empty() {
         return Ok(0);
     }
@@ -647,6 +658,7 @@ pub async fn seed_catalog(pool: &PgPool, providers: &[SeedProvider]) -> AppResul
             let kind = normalize_kind(&provider.kind)?;
             let name = require_nonempty(&provider.name, "name")?;
             let base_url = require_nonempty(&provider.base_url, "base_url")?;
+            url_policy::validate_provider_base_url(&base_url, policy)?;
             let id = Uuid::new_v4().to_string();
             sqlx::query(
                 "INSERT INTO providers (id, name, kind, base_url, api_key) VALUES ($1, $2, $3, $4, $5)",
@@ -1150,6 +1162,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_provider_rejects_metadata_ip() {
+        let Some(pool) = crate::test_support::test_pool().await else {
+            eprintln!("skipping provider ssrf db test");
+            return;
+        };
+        let policy = UpstreamUrlPolicy::default();
+        let err = create_provider(
+            &pool,
+            &policy,
+            "evil",
+            "openai",
+            "http://169.254.169.254/",
+            None,
+        )
+        .await
+        .expect_err("metadata blocked");
+        assert!(err.to_string().contains("169.254"));
+    }
+
+    #[tokio::test]
     async fn seed_catalog_is_idempotent_and_completes_partial() {
         let Some(pool) = crate::test_support::test_pool().await else {
             assert!(
@@ -1182,8 +1214,9 @@ mod tests {
                 },
             ],
         }];
-        assert_eq!(seed_catalog(&pool, &providers).await.expect("seed"), 2);
-        assert_eq!(seed_catalog(&pool, &providers).await.expect("reseed"), 0);
+        let policy = UpstreamUrlPolicy::allow_loopback_for_tests();
+        assert_eq!(seed_catalog(&pool, &policy, &providers).await.expect("seed"), 2);
+        assert_eq!(seed_catalog(&pool, &policy, &providers).await.expect("reseed"), 0);
         let models = list_models(&pool).await.expect("list");
         assert!(models.iter().any(|m| m.id == first_id));
         assert!(models.iter().any(|m| m.id == second_id));
@@ -1221,7 +1254,8 @@ mod tests {
                 },
             ],
         }];
-        assert!(seed_catalog(&pool, &providers).await.is_err());
+        let policy = UpstreamUrlPolicy::allow_loopback_for_tests();
+        assert!(seed_catalog(&pool, &policy, &providers).await.is_err());
         let listed = list_providers(&pool).await.expect("providers");
         assert!(
             !listed.iter().any(|p| p.name == name),
@@ -1247,8 +1281,10 @@ mod tests {
         let name = format!("seed-resume-{}", Uuid::new_v4());
         let first_id = format!("ok-{}", Uuid::new_v4());
         let second_id = format!("ok-{}", Uuid::new_v4());
+        let policy = UpstreamUrlPolicy::allow_loopback_for_tests();
         let provider = create_provider(
             &pool,
+            &policy,
             &name,
             "openai",
             "http://127.0.0.1:9",
@@ -1286,7 +1322,7 @@ mod tests {
                 },
             ],
         }];
-        assert_eq!(seed_catalog(&pool, &providers).await.expect("resume"), 1);
+        assert_eq!(seed_catalog(&pool, &policy, &providers).await.expect("resume"), 1);
         let models = list_models(&pool).await.expect("list");
         assert!(models.iter().any(|m| m.id == first_id));
         assert!(models.iter().any(|m| m.id == second_id));

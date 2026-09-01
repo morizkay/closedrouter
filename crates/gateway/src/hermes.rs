@@ -156,6 +156,7 @@ async fn embed_via_catalog(state: &AppState, text: &str) -> AppResult<Vec<f32>> 
     .await?;
     upstream::embed_text(
         &state.http,
+        &state.upstream_url_policy,
         &route.provider,
         &route.upstream_model,
         text,

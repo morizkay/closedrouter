@@ -1,6 +1,6 @@
 //! HTTP handlers: OpenAI / Anthropic / DeepSeek / GLM / Cursor / Hermes / admin.
 
-use crate::auth::{AdminAuth, ApiAuth};
+use crate::auth::{metrics_authorized, AdminAuth, ApiAuth};
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::hermes;
@@ -10,6 +10,7 @@ use crate::upstream;
 use crate::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -25,14 +26,22 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    (
+pub async fn metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<impl IntoResponse> {
+    if !metrics_authorized(&headers, &state) {
+        return Err(AppError::Unauthorized(
+            "metrics require METRICS_TOKEN or admin credentials".into(),
+        ));
+    }
+    Ok((
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
         state.metrics.render(),
-    )
+    ))
 }
 
 fn cursor_model_object(id: &str, created: i64) -> Value {
@@ -89,8 +98,9 @@ async fn proxy_chat(
         protocol = incoming.as_str(),
         "chat request"
     );
-    let (response, meta) = upstream::proxy(
+    let (response, meta, stream_usage) = upstream::proxy(
         &state.http,
+        &state.upstream_url_policy,
         incoming,
         &route.provider,
         &route.upstream_model,
@@ -104,27 +114,55 @@ async fn proxy_chat(
     let upstream_model = route.upstream_model.clone();
     let model_for_log = model.clone();
     let limit = state.config.request_log_limit;
-    tokio::spawn(async move {
-        if let Err(err) = db::insert_request_log(
-            &pool,
-            db::RequestLogWrite {
-                key_id: Some(&key_id),
-                protocol: &protocol,
-                model: Some(&model_for_log),
-                upstream_model: Some(&upstream_model),
-                status: meta.status as i32,
-                latency_ms: meta.latency_ms.min(i32::MAX as u64) as i32,
-                prompt_tokens: meta.prompt_tokens,
-                completion_tokens: meta.completion_tokens,
-                error: meta.error.as_deref(),
-            },
-            limit,
-        )
-        .await
-        {
-            tracing::debug!(error = %err, "request log insert failed");
-        }
-    });
+
+    if let Some(usage_rx) = stream_usage {
+        tokio::spawn(async move {
+            let usage = usage_rx.await.unwrap_or_default();
+            let prompt_tokens = usage.prompt_tokens.or(meta.prompt_tokens);
+            let completion_tokens = usage.completion_tokens.or(meta.completion_tokens);
+            if let Err(err) = db::insert_request_log(
+                &pool,
+                db::RequestLogWrite {
+                    key_id: Some(&key_id),
+                    protocol: &protocol,
+                    model: Some(&model_for_log),
+                    upstream_model: Some(&upstream_model),
+                    status: meta.status as i32,
+                    latency_ms: meta.latency_ms.min(i32::MAX as u64) as i32,
+                    prompt_tokens,
+                    completion_tokens,
+                    error: meta.error.as_deref(),
+                },
+                limit,
+            )
+            .await
+            {
+                tracing::debug!(error = %err, "stream request log insert failed");
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(err) = db::insert_request_log(
+                &pool,
+                db::RequestLogWrite {
+                    key_id: Some(&key_id),
+                    protocol: &protocol,
+                    model: Some(&model_for_log),
+                    upstream_model: Some(&upstream_model),
+                    status: meta.status as i32,
+                    latency_ms: meta.latency_ms.min(i32::MAX as u64) as i32,
+                    prompt_tokens: meta.prompt_tokens,
+                    completion_tokens: meta.completion_tokens,
+                    error: meta.error.as_deref(),
+                },
+                limit,
+            )
+            .await
+            {
+                tracing::debug!(error = %err, "request log insert failed");
+            }
+        });
+    }
 
     if state.config.langfuse_enabled() {
         observability::spawn_trace(
@@ -188,7 +226,14 @@ pub async fn embeddings(
     let model = extract_model(&body)?.to_string();
     let route = db::resolve_model(&state.db, &model).await?;
     tracing::info!(key = %auth.key_name, model = %model, "embeddings");
-    upstream::embeddings(&state.http, &route.provider, &route.upstream_model, body).await
+    upstream::embeddings(
+        &state.http,
+        &state.upstream_url_policy,
+        &route.provider,
+        &route.upstream_model,
+        body,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -290,6 +335,7 @@ pub async fn admin_create_provider(
 ) -> AppResult<(StatusCode, Json<db::ProviderRecord>)> {
     let record = db::create_provider(
         &state.db,
+        &state.upstream_url_policy,
         &body.name,
         &body.kind,
         &body.base_url,
@@ -308,6 +354,7 @@ pub async fn admin_patch_provider(
     Ok(Json(
         db::update_provider(
             &state.db,
+            &state.upstream_url_policy,
             &id,
             body.name.as_deref(),
             body.kind.as_deref(),

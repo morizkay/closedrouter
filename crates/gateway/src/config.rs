@@ -22,6 +22,12 @@ pub struct Config {
     pub database_path: Option<PathBuf>,
     #[serde(default)]
     pub admin_token: Option<String>,
+    /// Bearer token for Prometheus `/metrics` scrapes. When unset, only `ADMIN_TOKEN` works.
+    #[serde(default)]
+    pub metrics_token: Option<String>,
+    /// Hostnames/IPs permitted to target private or loopback space (e.g. local Ollama).
+    #[serde(default)]
+    pub allow_private_upstream_hosts: Vec<String>,
     #[serde(default = "default_cors")]
     pub cors_origins: Vec<String>,
     /// Catalog model id used when Hermes asks ClosedRouter to embed text.
@@ -102,6 +108,8 @@ impl Default for Config {
             database_url: None,
             database_path: None,
             admin_token: None,
+            metrics_token: None,
+            allow_private_upstream_hosts: Vec::new(),
             cors_origins: default_cors(),
             embedding_model: None,
             request_log_limit: default_log_limit(),
@@ -150,6 +158,20 @@ impl Config {
         }
         if let Ok(token) = env::var("ADMIN_TOKEN") {
             config.admin_token = Some(token);
+        }
+        if let Ok(token) = env::var("METRICS_TOKEN") {
+            if !token.is_empty() {
+                config.metrics_token = Some(token);
+            }
+        }
+        if let Ok(hosts) = env::var("ALLOW_PRIVATE_UPSTREAM_HOSTS") {
+            if !hosts.trim().is_empty() {
+                config.allow_private_upstream_hosts = hosts
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
         }
         if let Ok(origins) = env::var("CORS_ORIGINS") {
             if origins.trim() == "*" {
@@ -230,6 +252,10 @@ impl Config {
                 .as_deref()
                 .map(|s| !s.is_empty())
                 .unwrap_or(false)
+    }
+
+    pub fn upstream_url_policy(&self) -> crate::url_policy::UpstreamUrlPolicy {
+        crate::url_policy::UpstreamUrlPolicy::from_allowlist(&self.allow_private_upstream_hosts)
     }
 }
 

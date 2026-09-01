@@ -9,6 +9,7 @@ use crate::translate::{
     openai_response_to_anthropic, openai_to_anthropic, rewrite_model, usage_from_body,
     OpenaiToAnthropicSse, Protocol,
 };
+use crate::url_policy::{self, UpstreamUrlPolicy};
 use anyhow::Context;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -18,6 +19,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 /// Outcome of a proxied call, used for logs / Langfuse / Prometheus.
 #[derive(Debug, Clone, Default)]
@@ -82,14 +84,22 @@ fn apply_upstream_auth(
     }
 }
 
+/// Token usage observed from a completed SSE stream.
+#[derive(Debug, Clone, Default)]
+pub struct StreamUsage {
+    pub prompt_tokens: Option<i32>,
+    pub completion_tokens: Option<i32>,
+}
+
 /// Proxy a chat completion / messages request, translating as needed.
 pub async fn proxy(
     client: &Client,
+    policy: &UpstreamUrlPolicy,
     incoming: Protocol,
     provider: &ProviderSecret,
     upstream_model: &str,
     body: Value,
-) -> AppResult<(Response, ProxyMeta)> {
+) -> AppResult<(Response, ProxyMeta, Option<oneshot::Receiver<StreamUsage>>)> {
     let started = Instant::now();
     let upstream_kind = Protocol::from_kind(&provider.kind)?;
     let stream = extract_stream(&body);
@@ -110,6 +120,7 @@ pub async fn proxy(
     };
 
     let url = chat_url(provider, upstream_kind);
+    url_policy::validate_outbound_url(&url, policy).await?;
 
     tracing::info!(
         incoming = incoming.as_str(),
@@ -126,7 +137,8 @@ pub async fn proxy(
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
 
     if stream {
-        let res = pipe_stream(incoming, upstream_kind, upstream_model, response, status).await?;
+        let (res, usage_rx) =
+            pipe_stream(incoming, upstream_kind, upstream_model, response, status).await?;
         let latency_ms = started.elapsed().as_millis() as u64;
         observability::record_request(
             incoming.as_str(),
@@ -149,6 +161,11 @@ pub async fn proxy(
                 prompt_tokens: None,
                 completion_tokens: None,
                 error,
+            },
+            if status.is_success() {
+                Some(usage_rx)
+            } else {
+                None
             },
         ));
     }
@@ -174,6 +191,7 @@ pub async fn proxy(
                 completion_tokens: None,
                 error: Some(message),
             },
+            None,
         ));
     }
 
@@ -215,12 +233,14 @@ pub async fn proxy(
             completion_tokens: completion,
             error: None,
         },
+        None,
     ))
 }
 
 /// OpenAI-compatible embeddings against an OpenAI-family provider.
 pub async fn embeddings(
     client: &Client,
+    policy: &UpstreamUrlPolicy,
     provider: &ProviderSecret,
     upstream_model: &str,
     mut body: Value,
@@ -234,6 +254,7 @@ pub async fn embeddings(
     }
     body = rewrite_model(body, upstream_model);
     let url = embeddings_url(provider);
+    url_policy::validate_outbound_url(&url, policy).await?;
     let response = apply_upstream_auth(client.post(&url).json(&body), provider)
         .send()
         .await?;
@@ -246,6 +267,7 @@ pub async fn embeddings(
 /// Fetch a single embedding vector (1536-d expected by Hermes).
 pub async fn embed_text(
     client: &Client,
+    policy: &UpstreamUrlPolicy,
     provider: &ProviderSecret,
     upstream_model: &str,
     input: &str,
@@ -255,6 +277,7 @@ pub async fn embed_text(
         "input": input,
     });
     let url = embeddings_url(provider);
+    url_policy::validate_outbound_url(&url, policy).await?;
     let response = apply_upstream_auth(client.post(&url).json(&body), provider)
         .send()
         .await?;
@@ -303,7 +326,8 @@ async fn pipe_stream(
     model: &str,
     response: reqwest::Response,
     status: StatusCode,
-) -> AppResult<Response> {
+) -> AppResult<(Response, oneshot::Receiver<StreamUsage>)> {
+    let (usage_tx, usage_rx) = oneshot::channel();
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -323,10 +347,11 @@ async fn pipe_stream(
         let byte_stream = response
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
-        let mut res = Response::new(Body::from_stream(byte_stream));
+        let tracked = track_stream_usage(byte_stream, usage_tx);
+        let mut res = Response::new(Body::from_stream(tracked));
         *res.status_mut() = status;
         *res.headers_mut() = headers;
-        return Ok(res);
+        return Ok((res, usage_rx));
     }
 
     let id = openai_chunk_id(model);
@@ -337,10 +362,12 @@ async fn pipe_stream(
         let mut rest = Vec::new();
         let mut openai_sse = OpenaiToAnthropicSse::default();
         let mut current_event = String::new();
+        let mut usage = StreamUsage::default();
         futures_util::pin_mut!(byte_stream);
         while let Some(chunk) = byte_stream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    capture_usage_from_sse_bytes(&mut rest, &bytes, &mut usage);
                     let lines = push_sse_bytes(&mut rest, &bytes);
                     for line in lines {
                         let frames = translate_sse_line(
@@ -363,6 +390,7 @@ async fn pipe_stream(
             }
         }
         for line in flush_sse_bytes(&mut rest) {
+            capture_usage_from_sse_line(&line, &mut usage);
             let frames = translate_sse_line(
                 &line,
                 to_openai,
@@ -375,12 +403,13 @@ async fn pipe_stream(
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(message));
             }
         }
+        let _ = usage_tx.send(usage);
     };
 
     let mut res = Response::new(Body::from_stream(converted));
     *res.status_mut() = status;
     *res.headers_mut() = headers;
-    Ok(res)
+    Ok((res, usage_rx))
 }
 
 fn convert_anthropic_line(
@@ -506,6 +535,71 @@ fn serialize_sse_frames(frames: Vec<String>) -> Vec<String> {
     messages
 }
 
+fn capture_usage_from_sse_bytes(buf: &mut Vec<u8>, chunk: &[u8], usage: &mut StreamUsage) {
+    let lines = push_sse_bytes(buf, chunk);
+    for line in lines {
+        capture_usage_from_sse_line(&line, usage);
+    }
+}
+
+fn capture_usage_from_sse_line(line: &str, usage: &mut StreamUsage) {
+    let Some(data) = line.strip_prefix("data:") else {
+        return;
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    merge_stream_usage(usage, &value);
+    if let Some(message) = value.get("message") {
+        merge_stream_usage(usage, message);
+    }
+}
+
+fn merge_stream_usage(usage: &mut StreamUsage, value: &Value) {
+    let (prompt, completion) = usage_from_body(value);
+    if prompt.is_some() {
+        usage.prompt_tokens = prompt;
+    }
+    if completion.is_some() {
+        usage.completion_tokens = completion;
+    }
+}
+
+fn track_stream_usage<S>(
+    byte_stream: S,
+    usage_tx: oneshot::Sender<StreamUsage>,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>>
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    async_stream::stream! {
+        let mut rest = Vec::new();
+        let mut usage = StreamUsage::default();
+        futures_util::pin_mut!(byte_stream);
+        while let Some(chunk) = byte_stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    capture_usage_from_sse_bytes(&mut rest, &bytes, &mut usage);
+                    yield Ok(bytes);
+                }
+                Err(err) => {
+                    let _ = usage_tx.send(usage);
+                    yield Err(err);
+                    return;
+                }
+            }
+        }
+        for line in flush_sse_bytes(&mut rest) {
+            capture_usage_from_sse_line(&line, &mut usage);
+        }
+        let _ = usage_tx.send(usage);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +617,10 @@ mod tests {
         }
     }
 
+    fn policy() -> UpstreamUrlPolicy {
+        UpstreamUrlPolicy::allow_loopback_for_tests()
+    }
+
     #[tokio::test]
     async fn openai_to_openai_rewrites_model() {
         let mock = MockServer::start().await;
@@ -538,8 +636,9 @@ mod tests {
             .await;
 
         let client = http_client().expect("client");
-        let (res, meta) = proxy(
+        let (res, meta, _) = proxy(
             &client,
+            &policy(),
             Protocol::OpenAi,
             &provider("openai", &mock.uri()),
             "llama3.2",
@@ -567,8 +666,9 @@ mod tests {
             .mount(&mock)
             .await;
         let client = http_client().expect("client");
-        let (res, _) = proxy(
+        let (res, _, _) = proxy(
             &client,
+            &policy(),
             Protocol::DeepSeek,
             &provider("openai", &mock.uri()),
             "deepseek-chat",
@@ -594,8 +694,9 @@ mod tests {
             .mount(&mock)
             .await;
         let client = http_client().expect("client");
-        let (res, _) = proxy(
+        let (res, _, _) = proxy(
             &client,
+            &policy(),
             Protocol::Glm,
             &provider("glm", &mock.uri()),
             "glm-4",
@@ -628,8 +729,9 @@ mod tests {
             .mount(&mock)
             .await;
         let client = http_client().expect("client");
-        let (res, meta) = proxy(
+        let (res, meta, _) = proxy(
             &client,
+            &policy(),
             Protocol::OpenAi,
             &provider("anthropic", &mock.uri()),
             "claude-3",
@@ -680,6 +782,45 @@ mod tests {
         assert!(messages[0].contains("data: {\"type\":\"message_stop\"}"));
         assert!(messages[0].ends_with("\n\n"));
         assert_eq!(messages[0].matches("\n\n").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn openai_stream_captures_usage_from_sse() {
+        let mock = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&mock)
+            .await;
+        let client = http_client().expect("client");
+        let (res, _, usage_rx) = proxy(
+            &client,
+            &policy(),
+            Protocol::OpenAi,
+            &provider("openai", &mock.uri()),
+            "model",
+            json!({"model": "m", "messages": [{"role":"user","content":"hi"}], "stream": true}),
+        )
+        .await
+        .expect("proxy");
+        assert!(res.status().is_success());
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(!body.is_empty());
+        let usage = usage_rx.expect("usage channel").await.expect("usage");
+        assert_eq!(usage.prompt_tokens, Some(9));
+        assert_eq!(usage.completion_tokens, Some(4));
     }
 
     #[test]

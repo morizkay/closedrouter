@@ -12,8 +12,10 @@ pub mod observability;
 pub mod routes;
 pub mod translate;
 pub mod upstream;
+pub mod url_policy;
 
 use crate::config::Config;
+use crate::url_policy::UpstreamUrlPolicy;
 use anyhow::Context;
 use axum::http::{header, HeaderValue, Method};
 use axum::routing::{delete, get, patch, post};
@@ -36,6 +38,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub http: reqwest::Client,
     pub admin_token: String,
+    pub metrics_token: Option<String>,
+    pub upstream_url_policy: UpstreamUrlPolicy,
     pub metrics: PrometheusHandle,
 }
 
@@ -70,6 +74,8 @@ pub async fn run() -> anyhow::Result<()> {
         db,
         http: upstream::http_client()?,
         admin_token: admin_token.clone(),
+        metrics_token: config.metrics_token.clone(),
+        upstream_url_policy: config.upstream_url_policy(),
         config: Arc::new(config.clone()),
         metrics,
     };
@@ -207,7 +213,8 @@ fn ensure_secure_admin_token(token: &str) -> anyhow::Result<()> {
 }
 
 async fn seed_from_config(db: &PgPool, config: &Config) -> anyhow::Result<()> {
-    let inserted = db::seed_catalog(db, &config.providers).await?;
+    let policy = config.upstream_url_policy();
+    let inserted = db::seed_catalog(db, &policy, &config.providers).await?;
     if inserted > 0 {
         tracing::info!(models = inserted, "seeded catalog from config");
     }
@@ -274,6 +281,7 @@ mod tests {
     use super::*;
     use axum::body::Body as HttpBody;
     use axum::http::{Request, StatusCode};
+    use sqlx::Row;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -331,6 +339,8 @@ mod tests {
             db,
             http: upstream::http_client().ok()?,
             admin_token: "test-admin".into(),
+            metrics_token: Some("test-metrics".into()),
+            upstream_url_policy: crate::url_policy::UpstreamUrlPolicy::allow_loopback_for_tests(),
             config: Arc::new(Config::default()),
             metrics,
         })
@@ -345,6 +355,266 @@ mod tests {
         assert!(ensure_secure_admin_token("change-me-now").is_err());
         assert!(ensure_secure_admin_token("a-unique-secret").is_ok());
         assert!(!is_insecure_admin_token("a-unique-secret"));
+    }
+
+    #[tokio::test]
+    async fn metrics_rejects_unauthenticated_requests() {
+        let Some(state) = test_state().await else {
+            eprintln!("skipping metrics auth test");
+            return;
+        };
+        let app = router(state, &["*".into()]);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(HttpBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn metrics_accepts_admin_token() {
+        let Some(state) = test_state().await else {
+            eprintln!("skipping metrics auth test");
+            return;
+        };
+        let app = router(state.clone(), &["*".into()]);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("x-admin-token", "test-admin")
+                    .body(HttpBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_accepts_metrics_token() {
+        let Some(state) = test_state().await else {
+            eprintln!("skipping metrics auth test");
+            return;
+        };
+        let app = router(state, &["*".into()]);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("x-metrics-token", "test-metrics")
+                    .body(HttpBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_create_provider_rejects_ssrf_url() {
+        let Some(state) = test_state().await else {
+            eprintln!("skipping provider ssrf test");
+            return;
+        };
+        let app = router(state, &["*".into()]);
+        let body = serde_json::json!({
+            "name": "evil",
+            "kind": "openai",
+            "base_url": "http://169.254.169.254/latest/meta-data"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/v1/providers")
+                    .header("content-type", "application/json")
+                    .header("x-admin-token", "test-admin")
+                    .body(HttpBody::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn openai_stream_http_records_usage() {
+        use http_body_util::BodyExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(state) = test_state().await else {
+            eprintln!("skipping openai stream http test");
+            return;
+        };
+
+        let mock = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&mock)
+            .await;
+
+        let provider = db::create_provider(
+            &state.db,
+            &state.upstream_url_policy,
+            &format!("stream-openai-{}", uuid::Uuid::new_v4()),
+            "openai",
+            &format!("{}/v1", mock.uri()),
+            Some("sk-test"),
+        )
+        .await
+        .expect("provider");
+        let model_id = format!("stream-openai-{}", uuid::Uuid::new_v4());
+        db::create_model(
+            &state.db,
+            &model_id,
+            &provider.id,
+            "upstream-model",
+            None,
+            None,
+        )
+        .await
+        .expect("model");
+        let (_key, plaintext) = db::create_api_key(&state.db, "stream-http")
+            .await
+            .expect("key");
+
+        let app = router(state.clone(), &["*".into()]);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {plaintext}"))
+                    .body(HttpBody::from(
+                        serde_json::json!({
+                            "model": model_id,
+                            "messages": [{"role":"user","content":"ping"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("data:"));
+        assert!(text.contains("hi"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let logs = sqlx::query("SELECT prompt_tokens, completion_tokens FROM request_logs ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(&state.db)
+            .await
+            .expect("log row");
+        let prompt: Option<i32> = logs.try_get("prompt_tokens").expect("prompt");
+        let completion: Option<i32> = logs.try_get("completion_tokens").expect("completion");
+        assert_eq!(prompt, Some(3));
+        assert_eq!(completion, Some(2));
+    }
+
+    #[tokio::test]
+    async fn anthropic_translated_stream_http_maps_finish_reason() {
+        use http_body_util::BodyExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(state) = test_state().await else {
+            eprintln!("skipping anthropic stream http test");
+            return;
+        };
+
+        let mock = MockServer::start().await;
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude\",\"usage\":{\"input_tokens\":4}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"pong\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&mock)
+            .await;
+
+        let provider = db::create_provider(
+            &state.db,
+            &state.upstream_url_policy,
+            &format!("stream-anthropic-{}", uuid::Uuid::new_v4()),
+            "anthropic",
+            &mock.uri(),
+            Some("sk-ant"),
+        )
+        .await
+        .expect("provider");
+        let model_id = format!("stream-anthropic-{}", uuid::Uuid::new_v4());
+        db::create_model(
+            &state.db,
+            &model_id,
+            &provider.id,
+            "claude-3",
+            None,
+            None,
+        )
+        .await
+        .expect("model");
+        let (_key, plaintext) = db::create_api_key(&state.db, "stream-anthropic-http")
+            .await
+            .expect("key");
+
+        let app = router(state, &["*".into()]);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {plaintext}"))
+                    .body(HttpBody::from(
+                        serde_json::json!({
+                            "model": model_id,
+                            "messages": [{"role":"user","content":"ping"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("pong"));
+        assert!(text.contains("\"finish_reason\":\"stop\""));
     }
 }
 
