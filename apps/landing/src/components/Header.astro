@@ -1,0 +1,21 @@
+---
+import favicon from '../assets/favicon.svg';
+---
+
+<header class="relative z-10 mx-auto flex max-w-6xl items-center justify-between px-6 py-6">
+	<a href="/" class="flex items-center gap-2.5">
+		<img src={favicon.src} alt="ClosedRouter" class="h-8 w-8" />
+		<span class="text-sm font-semibold tracking-[0.18em] uppercase">ClosedRouter</span>
+	</a>
+	<nav class="hidden items-center gap-8 text-sm text-mist md:flex">
+		<a href="#how" class="hover:text-paper">How it works</a>
+		<a href="#sdk" class="hover:text-paper">SDKs</a>
+		<a href="#docker" class="hover:text-paper">Docker</a>
+		<a
+			href="https://github.com/morizkay/closedrouter"
+			class="rounded-full border border-line px-4 py-1.5 text-paper hover:border-acid"
+		>
+			GitHub
+		</a>
+	</nav>
+</header>

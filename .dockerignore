@@ -1,0 +1,13 @@
+.git
+.github
+target
+**/node_modules
+**/.svelte-kit
+**/build
+**/.vercel
+data
+*.db
+.env
+apps/landing
+README.md
+LICENSE

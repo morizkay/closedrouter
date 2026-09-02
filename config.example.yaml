@@ -1,0 +1,27 @@
+# ClosedRouter runtime configuration
+# Copy to config.yaml or set CLOSEDROUTER_CONFIG.
+
+host: "0.0.0.0"
+port: 8080
+# database_url: "postgres://closedrouter:closedrouter@localhost:5432/closedrouter"
+# admin_token: "replace-me"
+# metrics_token: "replace-me-for-prometheus-scrapes"
+# Narrow opt-in for local upstreams (Ollama, etc.). Leave unset in production.
+# allow_private_upstream_hosts:
+#   - "127.0.0.1"
+#   - "localhost"
+# embedding_model: "text-embedding-3-small"
+# request_log_limit: 10000
+cors_origins:
+  - "*"
+
+langfuse:
+  enabled: false
+  # host: "http://localhost:3001"
+  # public_key: "pk-lf-..."
+  # secret_key: "sk-lf-..."
+
+# Seeded only when the catalog is empty (first boot).
+# Public HTTPS upstreams work out of the box. Local Ollama requires
+# allow_private_upstream_hosts (above) before using http://127.0.0.1:11434/v1.
+providers: []

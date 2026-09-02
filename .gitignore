@@ -1,0 +1,16 @@
+/target
+**/node_modules
+**/.svelte-kit
+**/build
+**/.vercel
+**/.netlify
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.local
+.DS_Store
+dist/
+apps/landing/.vercel
+apps/dashboard/.vercel
