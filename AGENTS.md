@@ -32,7 +32,9 @@ Run `cargo test --workspace` for gateway tests and `npm run check` for frontend 
 
 ## Commit & Pull Request Guidelines
 
-History favors short, imperative subjects such as `Add ...`, `Fix ...`, `Convert ...`, and `Bump ...`; include an issue/PR reference when relevant. PRs should explain the behavior change, list validation commands, call out configuration/security implications, and include screenshots for UI changes. Keep unrelated formatting or generated files out of the diff.
+Use Conventional Commits with the current branch name as the scope: `<type>(<branch>): <imperative summary>`. Examples: `feat(main): ...`, `fix(testing-1): ...`, and `chore(bug-xxxx): ...`. Follow the exact current branch name rather than substituting a generic scope. Keep subjects short and include an issue/PR reference when relevant. PRs should explain the behavior change, list validation commands, call out configuration/security implications, and include screenshots for UI changes. Keep unrelated formatting or generated files out of the diff.
+
+For releases, update the root `changelog.md`, commit the release changes, push the current branch, create an annotated semantic-version tag, and push that tag.
 
 ## Security & Configuration Tips
 
