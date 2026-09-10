@@ -134,9 +134,9 @@ mod tests {
         let pin_target = pinned_addr;
         let pinned_port = pinned_addr.port();
 
-        let evil_listener =
-            std::net::TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), pinned_port))
-                .expect("bind evil rebind listener on 127.0.0.2 with pinned port");
+        let evil_listener = std::net::TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), pinned_port))
+            .or_else(|_| std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
+            .expect("bind evil rebind listener on an available loopback address");
         let evil_addr = evil_listener.local_addr().expect("evil addr");
         let evil_mock = MockServer::builder()
             .listener(evil_listener)
@@ -154,12 +154,16 @@ mod tests {
         });
         let _guard = url_policy::test_dns_scope(hook);
         let policy = UpstreamUrlPolicy::from_allowlist(&["rebind-pin.example".into()]);
-        let url = format!(
+        let pinned_url = format!(
             "http://rebind-pin.example:{}/pin-check",
             pinned_addr.port()
         );
+        let evil_url = format!(
+            "http://rebind-pin.example:{}/pin-check",
+            evil_addr.port()
+        );
 
-        let pinned_response = send_pinned(&url, &policy, |client, url| client.get(url))
+        let pinned_response = send_pinned(&pinned_url, &policy, |client, url| client.get(url))
             .await
             .expect("pinned HTTP connect must reach wiremock on the pinned address");
         assert_eq!(
@@ -169,7 +173,7 @@ mod tests {
         );
 
         let evil_response = send_with_connect_resolver(
-            &url,
+            &evil_url,
             &policy,
             Arc::new(RebindEvilResolver { evil: evil_addr }),
             |client, url| client.get(url),

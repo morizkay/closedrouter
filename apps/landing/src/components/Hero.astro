@@ -2,40 +2,85 @@
 import { CURL_SNIPPET } from '../lib/content';
 ---
 
-<section class="relative z-10 mx-auto max-w-6xl px-6 pt-10 pb-24 md:pt-20">
-	<p class="mb-5 text-xs font-medium tracking-[0.28em] text-acid uppercase">Private LLM gateway</p>
-	<h1 class="max-w-3xl text-5xl leading-[0.95] font-semibold tracking-tight md:text-7xl">
-		OpenRouter, but local.
-	</h1>
-	<p class="mt-6 max-w-xl text-lg text-mist">
-		ClosedRouter is an LLM API gateway you run yourself. Point the OpenAI SDK, Anthropic SDK,
-		DeepSeek, GLM, LangChain, or Cursor at a box you control.
-	</p>
-	<div class="mt-10 flex flex-wrap gap-3">
-		<a
-			href="#docker"
-			class="rounded-full bg-acid px-5 py-2.5 text-sm font-semibold text-ink hover:brightness-95"
-		>
-			Self-host with Docker
-		</a>
-		<a
-			href="#sdk"
-			class="rounded-full border border-line px-5 py-2.5 text-sm text-paper hover:border-paper/40"
-		>
-			See the APIs
-		</a>
+<section class="relative z-10 mx-auto max-w-6xl px-6 pt-12 pb-24 sm:px-8 md:pt-20">
+	<div class="grid items-end gap-14 lg:grid-cols-[1.1fr_0.9fr]">
+		<div>
+			<div
+				class="mb-6 flex items-center gap-3 text-xs font-medium tracking-[0.2em] text-acid uppercase"
+			>
+				<span class="h-2 w-2 rounded-full bg-acid shadow-[0_0_12px_rgb(198_255_74_/_0.7)]"
+				></span>Private LLM gateway
+			</div>
+			<h1
+				class="max-w-3xl text-5xl leading-[0.94] font-extrabold tracking-[-0.07em] sm:text-6xl md:text-8xl"
+			>
+				OpenRouter,<br /><span class="text-acid">but local.</span>
+			</h1>
+			<p class="mt-7 max-w-xl text-base leading-7 text-mist sm:text-lg">
+				One private front door for every model you run. Keep your keys, routing rules, and traffic
+				on infrastructure you control.
+			</p>
+			<div class="mt-9 flex flex-wrap gap-3">
+				<a href="#docker" class="button-primary px-5 py-3"> Self-host with Docker </a>
+				<a href="#sdk" class="button-secondary px-5 py-3"> See the APIs </a>
+			</div>
+			<div class="mt-10 flex flex-wrap gap-x-6 gap-y-2 text-xs text-mist">
+				<span><strong class="font-mono text-paper">01</strong> gateway</span><span
+					><strong class="font-mono text-paper">06</strong> adapters</span
+				><span><strong class="font-mono text-paper">∞</strong> upstreams</span>
+			</div>
+		</div>
+		<div class="panel relative overflow-hidden p-6 lg:mb-2">
+			<div class="absolute -top-20 -right-20 h-52 w-52 rounded-full bg-acid/10 blur-3xl"></div>
+			<div class="relative">
+				<div class="flex items-center justify-between border-b border-line pb-4">
+					<span class="font-mono text-[10px] tracking-[0.15em] text-mist uppercase"
+						>Control plane</span
+					><span class="flex items-center gap-2 font-mono text-[10px] text-acid"
+						><span class="h-1.5 w-1.5 rounded-full bg-acid"></span>LOCAL</span
+					>
+				</div>
+				<div class="mt-6 space-y-4">
+					<div class="flex items-center justify-between">
+						<span class="text-sm text-mist">Client surface</span><span
+							class="font-mono text-sm text-paper">OpenAI / Anthropic</span
+						>
+					</div>
+					<div class="h-px bg-line"></div>
+					<div class="flex items-center justify-between">
+						<span class="text-sm text-mist">Routing target</span><span
+							class="font-mono text-sm text-acid">your providers</span
+						>
+					</div>
+					<div class="h-px bg-line"></div>
+					<div class="flex items-center justify-between">
+						<span class="text-sm text-mist">Credentials</span><span
+							class="text-cyan font-mono text-sm">server-side</span
+						>
+					</div>
+				</div>
+				<div class="mt-7 rounded-xl border border-acid/20 bg-acid/5 p-4">
+					<p class="font-mono text-[10px] tracking-[0.12em] text-acid uppercase">
+						Built for ownership
+					</p><p class="mt-2 text-sm leading-6 text-paper/80">
+						No vendor account. No shared proxy. No mystery routing.
+					</p>
+				</div>
+			</div>
+		</div>
 	</div>
 
-	<div
-		class="mt-16 overflow-hidden rounded-2xl border border-line bg-panel/80 shadow-[0_0_80px_rgb(198_255_74_/_0.06)] backdrop-blur"
-	>
-		<div class="flex items-center gap-2 border-b border-line px-4 py-3 text-xs text-mist">
+	<div class="panel mt-20 overflow-hidden">
+		<div class="flex flex-wrap items-center gap-2 border-b border-line px-5 py-4 text-xs text-mist">
 			<span class="h-2.5 w-2.5 rounded-full bg-white/15"></span>
 			<span class="h-2.5 w-2.5 rounded-full bg-white/15"></span>
 			<span class="h-2.5 w-2.5 rounded-full bg-acid/80"></span>
-			<span class="ml-3 font-mono">POST /v1/chat/completions</span>
+			<span class="ml-3 font-mono text-[11px]">POST /v1/chat/completions</span>
+			<span class="ml-auto rounded-full bg-acid/10 px-2.5 py-1 font-mono text-[10px] text-acid"
+				>200 OK</span
+			>
 		</div>
 		<pre
-			class="overflow-x-auto p-5 font-mono text-[13px] leading-relaxed text-paper/90">{CURL_SNIPPET}</pre>
+			class="overflow-x-auto p-6 font-mono text-[12px] leading-6 text-paper/90 sm:text-[13px]">{CURL_SNIPPET}</pre>
 	</div>
 </section>

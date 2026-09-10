@@ -474,7 +474,7 @@ mod tests {
             &state.upstream_url_policy,
             &format!("stream-openai-{}", uuid::Uuid::new_v4()),
             "openai",
-            &format!("{}/v1", mock.uri()),
+            &mock.uri(),
             Some("sk-test"),
         )
         .await
@@ -628,7 +628,6 @@ pub mod test_support {
     use tokio::sync::Mutex;
 
     static URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    static POOL: OnceLock<Mutex<Option<PgPool>>> = OnceLock::new();
 
     pub fn database_url_configured() -> bool {
         std::env::var("DATABASE_URL")
@@ -660,19 +659,11 @@ pub mod test_support {
         }
     }
 
-    /// Shared pool so parallel tests apply schema once against one database.
+    /// Create a fresh pool per test so one failed connection cannot poison later tests.
     pub async fn test_pool() -> Option<PgPool> {
-        let slot = POOL.get_or_init(|| Mutex::new(None));
-        let mut guard = slot.lock().await;
-        if let Some(pool) = guard.as_ref() {
-            return Some(pool.clone());
-        }
         let url = postgres_url().await?;
         match crate::db::connect(&url).await {
-            Ok(pool) => {
-                *guard = Some(pool.clone());
-                Some(pool)
-            }
+            Ok(pool) => Some(pool),
             Err(err) => {
                 eprintln!("postgres connect failed: {err:#}");
                 None

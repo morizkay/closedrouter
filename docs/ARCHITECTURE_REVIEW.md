@@ -11,7 +11,7 @@ This review is based on direct code inspection and running `cargo test --workspa
 
 ## Executive summary
 
-ClosedRouter is a **single-crate Axum gateway** with a **Postgres catalog**, **protocol translation layer**, **optional Hermes memory**, and **two frontends** (SvelteKit admin dashboard, Astro marketing site). The core idea is sound and the translation code is more serious than typical “thin proxy” projects: there are unit tests for tool calls, reasoning fields, SSE framing, and catalog seeding edge cases.
+ClosedRouter is a **single-crate Axum gateway** with a **Postgres catalog**, **protocol translation layer**, **optional Hermes memory**, and **two frontends** (React admin dashboard, Astro marketing site). The core idea is sound and the translation code is more serious than typical “thin proxy” projects: there are unit tests for tool calls, reasoning fields, SSE framing, and catalog seeding edge cases.
 
 The main risks are not “missing features” but **operational security** (SSRF via provider URLs, plaintext upstream keys, open metrics), **protocol completeness** (cross-family streaming is complex and under-tested at the HTTP boundary), and **schema/seed semantics** that will confuse operators as the product matures. The observability stack is appropriately gated behind `docker compose --profile full`, but several defaults in that profile are unsafe for anything beyond local dev.
 
@@ -24,7 +24,7 @@ The main risks are not “missing features” but **operational security** (SSRF
 | Path | What it actually is |
 | --- | --- |
 | `crates/gateway` | **The product.** One library + `closedrouter` binary. All routing, auth, translation, upstream proxy, DB, Hermes, metrics, Langfuse export. |
-| `apps/dashboard` | SvelteKit 5 + adapter-node admin UI. **Browser-only:** talks to gateway admin API with `ADMIN_TOKEN` from `localStorage`. |
+| `apps/dashboard` | React 19 + Vite admin UI with TanStack Router/Query and a static Node server. **Browser-only:** talks to gateway admin API with `ADMIN_TOKEN` from `localStorage`. |
 | `apps/landing` | Astro static marketing site (`@astrojs/vercel`). **Fully decoupled** from gateway runtime. |
 | `docker-compose.yml` | Slim default: Postgres + gateway + dashboard. `full` profile adds Traefik, Prometheus, Loki, Promtail, Grafana, Langfuse. |
 | `examples/langchain` | Manual scripts, not CI-gated. |
@@ -64,7 +64,7 @@ Client (OpenAI / Anthropic / DeepSeek / GLM / Cursor SDK)
 
 ### Dashboard and landing
 
-- **Dashboard:** Svelte 5 runes (`$state`, `$derived`). No server-side BFF; CORS must allow the browser origin. Pages: overview, keys, models/providers CRUD (create/delete only in UI), playground (non-streaming chat), inline docs.
+- **Dashboard:** React 19 with TanStack Router/Query. No server-side BFF; CORS must allow the browser origin. Pages: overview, keys, models/providers CRUD (create/delete only in UI), playground (non-streaming chat), inline docs.
 - **Landing:** Astro components, no shared code with dashboard. Correct separation for Vercel deploy.
 
 ### Tests and CI
@@ -72,7 +72,7 @@ Client (OpenAI / Anthropic / DeepSeek / GLM / Cursor SDK)
 `.github/workflows/ci.yml`:
 
 - Rust: `clippy -D warnings`, `cargo test` with Postgres service + `DATABASE_URL`.
-- Dashboard + landing: `npm ci`, `svelte-check` / Astro check, prettier/eslint.
+- Dashboard + landing: `npm ci`, TypeScript / Astro check, prettier/eslint.
 
 **What tests actually prove:**
 

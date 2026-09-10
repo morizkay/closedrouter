@@ -1,5 +1,5 @@
-import { session } from '$lib/session.svelte';
-import type { GatewayError } from '$lib/types';
+import { getSession } from './session';
+import type { GatewayError } from './types';
 
 export class ApiClientError extends Error {
 	status: number;
@@ -11,21 +11,22 @@ export class ApiClientError extends Error {
 	}
 }
 
-export async function adminRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+type RequestSession = Pick<ReturnType<typeof getSession>, 'gatewayUrl' | 'adminToken'>;
+
+export async function adminRequest<T>(
+	path: string,
+	init: RequestInit = {},
+	requestSession: RequestSession = getSession()
+): Promise<T> {
+	const session = requestSession;
 	const headers = new Headers(init.headers);
 	headers.set('Authorization', `Bearer ${session.adminToken}`);
 	if (init.body && !headers.has('Content-Type')) {
 		headers.set('Content-Type', 'application/json');
 	}
 
-	const response = await fetch(`${session.gatewayUrl}${path}`, {
-		...init,
-		headers
-	});
-
-	if (response.status === 204) {
-		return undefined as T;
-	}
+	const response = await fetch(`${session.gatewayUrl}${path}`, { ...init, headers });
+	if (response.status === 204) return undefined as T;
 
 	const text = await response.text();
 	let parsed: unknown = null;
@@ -54,16 +55,13 @@ export async function chatCompletions(args: {
 	messages: Array<{ role: string; content: string }>;
 	stream: boolean;
 }): Promise<Response> {
-	return fetch(`${session.gatewayUrl}/v1/chat/completions`, {
+	const { gatewayUrl } = getSession();
+	return fetch(`${gatewayUrl}/v1/chat/completions`, {
 		method: 'POST',
 		headers: {
 			Authorization: `Bearer ${args.apiKey}`,
 			'Content-Type': 'application/json'
 		},
-		body: JSON.stringify({
-			model: args.model,
-			messages: args.messages,
-			stream: args.stream
-		})
+		body: JSON.stringify({ model: args.model, messages: args.messages, stream: args.stream })
 	});
 }

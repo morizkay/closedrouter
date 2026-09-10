@@ -1,6 +1,6 @@
 # ClosedRouter
 
-OpenRouter, but local. A self-hosted LLM API gateway with **OpenAI**, **Anthropic**, **DeepSeek**, **GLM**, and **Cursor**-compatible APIs, Hermes memory (pgvector), a SvelteKit dashboard, and an Astro marketing site (Vercel-ready).
+OpenRouter, but local. A self-hosted LLM API gateway with **OpenAI**, **Anthropic**, **DeepSeek**, **GLM**, and **Cursor**-compatible APIs, Hermes memory (pgvector), a React dashboard, and an Astro marketing site (Vercel-ready).
 
 Your models, your keys, your network.
 

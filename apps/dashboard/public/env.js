@@ -1,0 +1,1 @@
+window.__CLOSEDROUTER_CONFIG__ = window.__CLOSEDROUTER_CONFIG__ || {};

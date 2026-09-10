@@ -21,7 +21,7 @@ Cursor / OpenAI SDK / Anthropic SDK / DeepSeek SDK / GLM SDK / LangChain
 | Process | Role |
 | --- | --- |
 | `closedrouter` (`crates/gateway`) | Axum HTTP API, translation, Hermes memory, `/metrics` |
-| `apps/dashboard` | SvelteKit 5 admin (adapter-node) |
+| `apps/dashboard` | React 19 + Vite admin (TanStack Router + Query, static Node server) |
 | `apps/landing` | Astro marketing site (adapter-vercel) |
 | Postgres 16 + pgvector | Keys, catalog, request logs, Hermes embeddings |
 | Traefik / Grafana / Loki / Prometheus / Langfuse | Observability; compose profile `full` |

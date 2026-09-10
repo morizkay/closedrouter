@@ -2,20 +2,46 @@
 import favicon from '../assets/favicon.svg';
 ---
 
-<header class="relative z-10 mx-auto flex max-w-6xl items-center justify-between px-6 py-6">
-	<a href="/" class="flex items-center gap-2.5">
-		<img src={favicon.src} alt="ClosedRouter" class="h-8 w-8" />
-		<span class="text-sm font-semibold tracking-[0.18em] uppercase">ClosedRouter</span>
-	</a>
-	<nav class="hidden items-center gap-8 text-sm text-mist md:flex">
-		<a href="#how" class="hover:text-paper">How it works</a>
-		<a href="#sdk" class="hover:text-paper">SDKs</a>
-		<a href="#docker" class="hover:text-paper">Docker</a>
-		<a
-			href="https://github.com/morizkay/closedrouter"
-			class="rounded-full border border-line px-4 py-1.5 text-paper hover:border-acid"
-		>
-			GitHub
+<header class="sticky top-0 z-20 border-b border-line bg-white/90 backdrop-blur-xl">
+	<div class="relative mx-auto flex max-w-6xl items-center justify-between px-6 py-5 sm:px-8">
+		<a href="/" class="flex items-center gap-3">
+			<img
+				src={favicon.src}
+				alt="ClosedRouter"
+				class="h-9 w-9 rounded-[11px] shadow-[0_3px_10px_rgb(255_56_92_/_0.2)]"
+			/>
+			<div>
+				<span class="block text-sm font-extrabold tracking-[0.16em] uppercase">ClosedRouter</span>
+				<span class="mt-0.5 block text-[10px] tracking-[0.14em] text-mist uppercase"
+					>Yours on your own</span
+				>
+			</div>
 		</a>
-	</nav>
+		<nav class="hidden items-center gap-7 text-sm text-mist md:flex">
+			<a href="#how" class="hover:text-paper">How it works</a>
+			<a href="#sdk" class="hover:text-paper">SDKs</a>
+			<a href="#docker" class="hover:text-paper">Docker</a>
+			<a
+				href="https://github.com/morizkay/closedrouter"
+				class="button-secondary px-4 py-2 text-paper"
+				>GitHub <span class="ml-2 text-acid">↗</span></a
+			>
+		</nav>
+		<details class="relative md:hidden">
+			<summary class="button-secondary list-none px-3 py-2 text-xs">Menu</summary>
+			<nav
+				class="panel absolute top-12 right-0 z-20 flex min-w-44 flex-col gap-1 p-2 text-sm text-mist"
+			>
+				<a href="#how" class="rounded-lg px-3 py-2 hover:bg-white/5 hover:text-paper"
+					>How it works</a
+				>
+				<a href="#sdk" class="rounded-lg px-3 py-2 hover:bg-white/5 hover:text-paper">SDKs</a>
+				<a href="#docker" class="rounded-lg px-3 py-2 hover:bg-white/5 hover:text-paper">Docker</a>
+				<a
+					href="https://github.com/morizkay/closedrouter"
+					class="rounded-lg px-3 py-2 hover:bg-white/5 hover:text-paper">GitHub ↗</a
+				>
+			</nav>
+		</details>
+	</div>
 </header>

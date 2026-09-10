@@ -12,8 +12,7 @@ WORKDIR /app
 ENV HOST=0.0.0.0 \
     PORT=3000 \
     NODE_ENV=production
-COPY --from=builder /app/build ./build
-COPY --from=builder /app/package.json ./
-COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/server.mjs ./server.mjs
 EXPOSE 3000
-CMD ["node", "build/index.js"]
+CMD ["node", "server.mjs"]
